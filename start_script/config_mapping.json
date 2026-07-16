@@ -1,0 +1,174 @@
+{
+  "mappings": [
+    {
+      "path": "data.train_files",
+      "template": "${MA_DATASET_DIR}/train.parquet",
+      "default": "data-files/math/train.parquet"
+    },
+    {
+      "path": "data.val_files",
+      "template": "${MA_DATASET_DIR}/test.parquet",
+      "default": "data-files/math/test.parquet"
+    },
+    {
+      "path": "data.train_batch_size",
+      "template": "${TRAIN_BATCH_SIZE}",
+      "type": "int",
+      "default": 32
+    },
+    {
+      "path": "data.max_prompt_length",
+      "template": "${MAX_PROMPT_LENGTH}",
+      "type": "int",
+      "default": 2048
+    },
+    {
+      "path": "data.max_response_length",
+      "template": "${MAX_RESPONSE_LENGTH}",
+      "type": "int",
+      "default": 4096
+    },
+    {
+      "path": "actor_rollout_ref.model.path",
+      "template": "${MODEL_PATH}",
+      "default": "/data/nfs/model/Qwen3-8B"
+    },
+    {
+      "path": "actor_rollout_ref.actor.optim.lr",
+      "template": "${LR}",
+      "type": "float",
+      "default": 1e-6
+    },
+    {
+      "path": "actor_rollout_ref.actor.ppo_mini_batch_size",
+      "template": "${PPO_MINI_BATCH_SIZE}",
+      "type": "int",
+      "default": 32
+    },
+    {
+      "path": "actor_rollout_ref.actor.use_kl_loss",
+      "template": "${USE_KL_LOSS}",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "path": "actor_rollout_ref.actor.kl_loss_coef",
+      "template": "${KL_LOSS_COEF}",
+      "type": "float",
+      "default": 0.001
+    },
+    {
+      "path": "actor_rollout_ref.actor.ulysses_sequence_parallel_size",
+      "template": "${ULYSSES_SEQUENCE_PARALLEL_SIZE}",
+      "type": "int",
+      "default": 1
+    },
+    {
+      "path": "actor_rollout_ref.rollout.tensor_model_parallel_size",
+      "template": "${ROLLOUT_TENSOR_MODEL_PARALLEL_SIZE}",
+      "type": "int",
+      "default": 1
+    },
+    {
+      "path": "actor_rollout_ref.rollout.temperature",
+      "template": "${ROLLOUT_TEMPERATURE}",
+      "type": "float",
+      "default": 0.6
+    },
+    {
+      "path": "actor_rollout_ref.rollout.n",
+      "template": "${ROLLOUT_N}",
+      "type": "int",
+      "default": 4
+    },
+    {
+      "path": "actor_rollout_ref.rollout.gpu_memory_utilization",
+      "template": "${ROLLOUT_GPU_MEMORY_UTILIZATION}",
+      "type": "float",
+      "default": 0.7
+    },
+    {
+      "path": "actor_rollout_ref.actor.entropy_coeff",
+      "template": "${ENTROPY_COEFF}",
+      "type": "float",
+      "default": 0.0
+    },
+    {
+      "path": "trainer.critic_warmup",
+      "template": "${CRITIC_WARMUP}",
+      "type": "int",
+      "default": 0
+    },
+    {
+      "path": "trainer.save_freq",
+      "template": "${SAVE_FREQ}",
+      "type": "int",
+      "default": 10
+    },
+    {
+      "path": "trainer.test_freq",
+      "template": "${TEST_FREQ}",
+      "type": "int",
+      "default": 10
+    },
+    {
+      "path": "trainer.total_training_steps",
+      "template": "${TOTAL_TRAINING_STEPS}",
+      "type": "int",
+      "default": 10
+    },
+    {
+      "path": "trainer.default_local_dir",
+      "template": "${LOCAL_MODEL_OUTPUT}",
+      "default": "/home/ma-user/modelarts/output"
+    }
+  ],
+  "fixed": {
+    "algorithm": {
+      "adv_estimator": "grpo",
+      "use_kl_in_reward": false
+    },
+    "actor_rollout_ref": {
+      "rollout": {
+        "log_prob_micro_batch_size_per_gpu": 4,
+        "multi_turn": {"format": "hermes"},
+        "name": "vllm",
+        "engine_kwargs": {
+          "vllm": {
+            "enable_auto_tool_choice": true,
+            "tool_call_parser": "hermes",
+            "enable_prefix_caching": true
+          }
+        }
+      },
+      "actor": {
+        "clip_ratio_low": 0.2,
+        "clip_ratio_high": 0.3,
+        "fsdp_config": {
+          "param_offload": true,
+          "optimizer_offload": true
+        },
+        "ppo_micro_batch_size_per_gpu": 4
+      },
+      "ref": {
+        "log_prob_micro_batch_size_per_gpu": 8,
+        "fsdp_config": {"param_offload": true},
+        "engine": {"ulysses_sequence_parallel_size": 1}
+      },
+      "model": {
+        "use_remove_padding": true,
+        "enable_gradient_checkpointing": true,
+        "use_fused_kernels": true
+      }
+    },
+    "trainer": {
+      "n_gpus_per_node": 16,
+      "val_before_train": false,
+      "logger": ["console", "tensorboard"],
+      "project_name": "AgentLightning",
+      "experiment_name": "calc_x",
+      "nnodes": 1,
+      "total_epochs": 2
+    }
+  }
+}
