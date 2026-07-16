@@ -353,7 +353,7 @@ class AgentLightningTrainer(RayPPOTrainer):
             )
             batch = batch[keep_indices]
             # next, round to minibatch size
-            mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+            mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
             n_transition = len(batch)
             random_indices = list(range(n_transition))
             random.shuffle(random_indices)
