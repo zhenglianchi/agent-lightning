@@ -179,6 +179,8 @@ class AgentLightningTrainer(RayPPOTrainer):
         llm_proxy: LLMProxy | None,
         adapter: TraceAdapter | None,
         daemon_cls: Type[AgentModeDaemon],
+        reward_fn=None,
+        val_reward_fn=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -186,6 +188,8 @@ class AgentLightningTrainer(RayPPOTrainer):
         self.llm_proxy = llm_proxy
         self.adapter = adapter
         self.daemon_cls = daemon_cls
+        self.reward_fn = reward_fn
+        self.val_reward_fn = val_reward_fn
 
     def _validate(self):
         assert len(self.val_dataloader) == 1, "Please set val_batch_size to None for better throughput."
@@ -193,52 +197,22 @@ class AgentLightningTrainer(RayPPOTrainer):
         test_data = next(iter(self.val_dataloader))
         test_batch = DataProto.from_single_dict(test_data)
 
-        self.async_rollout_manager.wake_up()
+        self.checkpoint_manager.wake_up_replicas()
         self.agent_mode_daemon.set_up_data_and_server(
             test_batch.non_tensor_batch,
-            self.async_rollout_manager.server_addresses,
+            self.llm_server_manager.get_addresses(),
             is_train=False,
         )
         self.agent_mode_daemon.run_until_all_finished()
         test_metrics = self.agent_mode_daemon.get_test_metrics()
         self.agent_mode_daemon.clear_data_and_server()
-        self.async_rollout_manager.sleep()
+        self.checkpoint_manager.sleep_replicas()
         return test_metrics
-
-    def _compute_reference_log_prob(self, batch: DataProto) -> DataProto:
-        """Compute reference log probability using the correct worker based on LoRA configuration.
-
-        In verl 0.6.0+, when LoRA is detected (indicated by ref_in_actor=True),
-        the reference policy is computed by the actor rollout worker instead of a separate
-        ref policy worker. This method handles both scenarios by checking the ref_in_actor flag.
-        Note: verl sets ref_in_actor=True when it detects LoRA configuration (e.g., lora_rank > 0 or lora_adapter_path is set).
-
-        Args:
-            batch: The data batch to compute reference log probabilities for.
-
-        Returns:
-            DataProto with reference log probabilities added.
-
-        Raises:
-            RuntimeError: If the required worker is not available.
-        """
-        if getattr(self, "ref_in_actor", False):
-            actor_worker = getattr(self, "actor_rollout_wg", None)
-            if actor_worker is None:
-                raise RuntimeError("actor_rollout_wg is required when ref_in_actor is True.")
-            return actor_worker.compute_ref_log_prob(batch)
-
-        ref_worker = getattr(self, "ref_policy_wg", None)
-        if ref_worker is None:
-            raise RuntimeError(
-                "Reference policy worker was not initialized. "
-                "Ensure `use_reference_policy` is enabled and the VERL config exposes the ref worker."
-            )
-        return ref_worker.compute_ref_log_prob(batch)
 
     def _train_step(self, batch_dict: dict) -> dict:
         # Isolate in a separate method to automatically recycle the variables before validation.
         batch: DataProto = DataProto.from_single_dict(batch_dict)
+        
         metrics = {}
         timing_raw = {}
 
@@ -249,9 +223,9 @@ class AgentLightningTrainer(RayPPOTrainer):
 
             # generate a batch
             with _timer("gen", timing_raw):
-                self.async_rollout_manager.wake_up()
+                self.checkpoint_manager.wake_up_replicas()
                 self.agent_mode_daemon.set_up_data_and_server(
-                    gen_batch.non_tensor_batch, self.async_rollout_manager.server_addresses
+                    gen_batch.non_tensor_batch, self.llm_server_manager.get_addresses()
                 )
                 self.agent_mode_daemon.run_until_all_finished()
                 batch, agent_metrics = self.agent_mode_daemon.get_train_data_batch(
@@ -270,7 +244,7 @@ class AgentLightningTrainer(RayPPOTrainer):
                 )
                 metrics.update(agent_metrics)
                 self.agent_mode_daemon.clear_data_and_server()
-                self.async_rollout_manager.sleep()
+                self.checkpoint_manager.sleep_replicas()
 
             if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                 with _timer("gen_max", timing_raw):
@@ -290,32 +264,36 @@ class AgentLightningTrainer(RayPPOTrainer):
 
             # uid is used for algorithm like GRPO, should be aligned to data id
             batch.non_tensor_batch["uid"] = batch.non_tensor_batch["data_id_list"]
+            
 
             if "response_mask" not in batch.batch:
                 batch.batch["response_mask"] = compute_response_mask(batch)
 
             # compute global_valid tokens
             batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+            batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
             with _timer("reward", timing_raw):
                 # compute reward model score
                 if self.use_rm:
-                    reward_tensor = self.rm_wg.compute_rm_score(batch)
+                    reward_tensor = self.reward_loop_manager.compute_rm_score(batch)
                     batch = batch.union(reward_tensor)
 
                 reward_extra_infos_dict = {}
-
             # for agent mode, pad the lengths to calculate old log prob, ref, and values
             batch, pad_size = pad_dataproto_to_divisor(batch, self.actor_rollout_wg.world_size)
 
             # recompute old_log_probs
             with _timer("old_log_prob", timing_raw):
-                old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                 entropys = old_log_prob.batch["entropys"]
                 response_masks = batch.batch["response_mask"]
                 loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
                 entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
+                old_log_prob_metrics = {
+                    "actor/entropy": entropy_loss.detach().item(),
+                    "perf/mfu/actor_infer": old_log_prob_mfu,
+                }
                 metrics.update(old_log_prob_metrics)
                 old_log_prob.batch.pop("entropys")
                 batch = batch.union(old_log_prob)
@@ -323,13 +301,13 @@ class AgentLightningTrainer(RayPPOTrainer):
             if self.use_reference_policy:
                 # compute reference log_prob
                 with _timer("ref", timing_raw):
-                    ref_log_prob = self._compute_reference_log_prob(batch)
+                    ref_log_prob = self._compute_ref_log_prob(batch)
                     batch = batch.union(ref_log_prob)
 
             # compute values
             if self.use_critic:
                 with _timer("values", timing_raw):
-                    values = self.critic_wg.compute_values(batch)
+                    values = self._compute_values(batch)
                     batch = batch.union(values)
 
             # for agent mode, unpad to calculate adv
@@ -375,7 +353,7 @@ class AgentLightningTrainer(RayPPOTrainer):
             )
             batch = batch[keep_indices]
             # next, round to minibatch size
-            mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+            mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
             n_transition = len(batch)
             random_indices = list(range(n_transition))
             random.shuffle(random_indices)
@@ -397,7 +375,7 @@ class AgentLightningTrainer(RayPPOTrainer):
             # update critic
             if self.use_critic:
                 with _timer("update_critic", timing_raw):
-                    critic_output = self.critic_wg.update_critic(batch)
+                    critic_output = self._update_critic(batch)
                 critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                 metrics.update(critic_output_metrics)
 
@@ -405,8 +383,7 @@ class AgentLightningTrainer(RayPPOTrainer):
             if self.config.trainer.critic_warmup <= self.global_steps:
                 # update actor
                 with _timer("update_actor", timing_raw):
-                    batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                    actor_output = self.actor_rollout_wg.update_actor(batch)
+                    actor_output = self._update_actor(batch)
                 actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                 metrics.update(actor_output_metrics)
 
@@ -447,19 +424,14 @@ class AgentLightningTrainer(RayPPOTrainer):
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+        self.checkpoint_manager.update_weights(self.global_steps)  # 新增：同步权重到 vLLM
 
         assert self.async_rollout_mode, "If agent mode is enabled, async server must be enabled"
         if self.adapter is not None and not isinstance(self.adapter, TraceToTripletBase):
             raise ValueError("Adapter must be a TraceToTripletBase for currently VERL implementation.")
-        verl_version = verl.__version__
-        if verl_version == "0.5.0":
-            # Note (Zhiyuan): To avoid further patch into vllm async server, using the same sentence to get the naming here.
-            # However, it is possible that verl updates the naming and causes incompatibility.
-            # Reference: https://github.com/volcengine/verl/blob/5b5e09d9cc20625e436d01f69d9cc739ff681c54/verl/workers/rollout/vllm_rollout/vllm_async_server.py#L217
-            model = "/".join(self.config.actor_rollout_ref.model.path.split("/")[-2:])
-        else:
-            # For other versions (e.g., 0.6.0), we use the full path to the model.
-            model = self.config.actor_rollout_ref.model.path
+        
+        model = self.config.actor_rollout_ref.model.path
+        
         self.agent_mode_daemon = self.daemon_cls(
             self.config.agentlightning.port,
             self.config.actor_rollout_ref.rollout.n,
