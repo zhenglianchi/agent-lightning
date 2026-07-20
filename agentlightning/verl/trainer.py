@@ -56,7 +56,7 @@ def _timer(name: str, timing_raw: Dict[str, float]):
 
 # This function is adapted from verl.
 # We introduce a new parameter `suffix` to distinguish between metrics computed
-# before and after AgentLightning’s post-processing.
+# before and after AgentLightning鈥檚 post-processing.
 # - "Before" refers to raw reward and advantage values.
 # - "After" refers to values computed following post-processing, which involves:
 #     (1) Dropping prompts that exceed the maximum allowed length.
@@ -281,7 +281,8 @@ class AgentLightningTrainer(RayPPOTrainer):
 
                 reward_extra_infos_dict = {}
             # for agent mode, pad the lengths to calculate old log prob, ref, and values
-            batch, pad_size = pad_dataproto_to_divisor(batch, self.actor_rollout_wg.world_size)
+            divisor = self.actor_rollout_wg.world_size * self.config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
+            batch, pad_size = pad_dataproto_to_divisor(batch, divisor)
 
             # recompute old_log_probs
             with _timer("old_log_prob", timing_raw):
@@ -424,7 +425,7 @@ class AgentLightningTrainer(RayPPOTrainer):
 
         # load checkpoint before doing anything
         self._load_checkpoint()
-        self.checkpoint_manager.update_weights(self.global_steps)  # 新增：同步权重到 vLLM
+        self.checkpoint_manager.update_weights(self.global_steps)  # 鏂板锛氬悓姝ユ潈閲嶅埌 vLLM
 
         assert self.async_rollout_mode, "If agent mode is enabled, async server must be enabled"
         if self.adapter is not None and not isinstance(self.adapter, TraceToTripletBase):
