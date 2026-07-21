@@ -103,7 +103,7 @@
       "path": "trainer.save_freq",
       "template": "${SAVE_FREQ}",
       "type": "int",
-      "default": 10
+      "default": 100
     },
     {
       "path": "trainer.test_freq",

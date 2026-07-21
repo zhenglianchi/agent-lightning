@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import math
+
 import random
 from contextlib import contextmanager
 from copy import deepcopy
@@ -281,10 +283,11 @@ class AgentLightningTrainer(RayPPOTrainer):
 
                 reward_extra_infos_dict = {}
             # for agent mode, pad the lengths to calculate old log prob, ref, and values
+            print("padding before: ",batch.batch.batch_size)
             micro_bsz = self.config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
             divisor = self.actor_rollout_wg.world_size * micro_bsz
             batch, pad_size = pad_dataproto_to_divisor(batch, divisor)
-
+            print("padding: ",batch.batch.batch_size)
             # recompute old_log_probs
             with _timer("old_log_prob", timing_raw):
                 old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
@@ -315,6 +318,7 @@ class AgentLightningTrainer(RayPPOTrainer):
             # for agent mode, unpad to calculate adv
             # it is important, as adv should be based on the raw traces
             batch = unpad_dataproto(batch, pad_size=pad_size)
+            print("unpad: ", batch.batch.batch_size)
 
             with _timer("adv", timing_raw):
                 # if agent_mode is enabled, there is already token_level_scores
@@ -354,15 +358,26 @@ class AgentLightningTrainer(RayPPOTrainer):
                 batch.batch["is_drop_mask"].shape[0] - keep_indices.shape[0]
             )
             batch = batch[keep_indices]
-            # next, round to minibatch size
-            mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+            print("drop_prompt: ",batch.batch.batch_size)
+            ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+            rollout_n = self.config.actor_rollout_ref.rollout.n
+            per_gpu_divisor = self.actor_rollout_wg.world_size * (ppo_mini_batch_size * rollout_n // self.actor_rollout_wg.world_size)
             n_transition = len(batch)
             random_indices = list(range(n_transition))
             random.shuffle(random_indices)
             batch.reorder(torch.tensor(random_indices).type(torch.int32))
-            n_remained_transition = n_transition // mini_batch_size * mini_batch_size
-            batch = batch[list(range(n_remained_transition))]
-            metrics["training/n_triplets_dropped_remainder"] = n_transition - n_remained_transition
+            if n_transition % per_gpu_divisor != 0:
+                floor_pad_size = per_gpu_divisor - n_transition % per_gpu_divisor
+                batch, _ = pad_dataproto_to_divisor(batch, per_gpu_divisor)
+                batch.batch["response_mask"][-floor_pad_size:] = 0
+                if "token_level_rewards" in batch.batch:
+                    batch.batch["token_level_rewards"][-floor_pad_size:] = 0
+                if "advantages" in batch.batch:
+                    batch.batch["advantages"][-floor_pad_size:] = 0
+            else:
+                floor_pad_size = 0
+            print("floor pad: ", batch.batch.batch_size, "pad_size: ", floor_pad_size)
+            metrics["training/n_triplets_padded_remainder"] = floor_pad_size
 
             # Agent mode note: Change the order of balance batch;
             #     1. first calculate advantage
@@ -426,7 +441,7 @@ class AgentLightningTrainer(RayPPOTrainer):
 
         # load checkpoint before doing anything
         self._load_checkpoint()
-        self.checkpoint_manager.update_weights(self.global_steps)  # 鏂板锛氬悓姝ユ潈閲嶅埌 vLLM
+        self.checkpoint_manager.update_weights(self.global_steps) 
 
         assert self.async_rollout_mode, "If agent mode is enabled, async server must be enabled"
         if self.adapter is not None and not isinstance(self.adapter, TraceToTripletBase):
@@ -475,6 +490,7 @@ class AgentLightningTrainer(RayPPOTrainer):
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
+
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 # train step

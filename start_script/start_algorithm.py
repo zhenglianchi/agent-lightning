@@ -20,7 +20,7 @@ _BOOL_TRUE_VALUES = frozenset({"true", "1", "yes"})
 
 DEFAULT_MAPPING_FILE = "config_mapping.json"
 DEFAULT_STORE_ADDRESS = "http://127.0.0.1:4748"
-
+os.environ["VLLM_ASCEND_ENABLE_NZ"] = "0"
 
 # ==================== 嵌套字典工具 ====================
 def set_nested_value(dic: Dict, path: str, value: Any) -> None:
