@@ -1,0 +1,59 @@
+diff --git a/verl/workers/engine/utils.py b/verl/workers/engine/utils.py
+index 47a35bcb..4abb7037 100644
+--- a/verl/workers/engine/utils.py
++++ b/verl/workers/engine/utils.py
+@@ -88,6 +88,8 @@ def prepare_micro_batches(
+     else:
+         total_data_size = len(data)
+         micro_batch_size_per_gpu = data["micro_batch_size_per_gpu"]
++        print("total_data_size: ",total_data_size)
++        print("micro_batch_size_per_gpu: ",micro_batch_size_per_gpu)
+         assert total_data_size % (force_group_size * micro_batch_size_per_gpu) == 0, (
+             "data size must be divisible by force_group_size * micro_batch_size_per_gpu"
+         )
+diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
+index bf379b49..8a6aac89 100644
+--- a/verl/workers/engine_workers.py
++++ b/verl/workers/engine_workers.py
+@@ -255,6 +255,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
+             assert batch_size_per_dp % num_mini_batch == 0, f"Got {batch_size_per_dp=} and {num_mini_batch=}"
+             mini_batch_size_per_gpu = batch_size_per_dp // num_mini_batch
+         else:
++            print("mini_batch_size: ",mini_batch_size)
++            print("get_data_parallel_size: ",self.engine.get_data_parallel_size())
+             assert mini_batch_size % self.engine.get_data_parallel_size() == 0, (
+                 f"Got {mini_batch_size=} and {self.engine.get_data_parallel_size()=}"
+             )
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index d4194e1c..34bb2658 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -81,6 +81,7 @@ logger = logging.getLogger(__file__)
+ logger.setLevel(logging.INFO)
+ 
+ 
++@ray.remote(num_cpus=1)
+ class vLLMHttpServer:
+     """vLLM http server in single node, this is equivalent to launch server with command line:
+     ```
+@@ -963,7 +964,7 @@ class vLLMReplica(RolloutReplica):
+         super().__init__(
+             replica_rank, config, model_config, gpus_per_node, is_reward_model, is_teacher_model, name_suffix
+         )
+-        self.server_class = ray.remote(vLLMHttpServer)
++        self.server_class = vLLMHttpServer
+ 
+     async def launch_servers(self):
+         """Launch http server in each node."""
+@@ -1017,9 +1018,9 @@ class vLLMReplica(RolloutReplica):
+                     node_id=node_id,
+                     soft=False,
+                 ),
+-                runtime_env={"env_vars": env_vars},
++                #runtime_env={"env_vars": env_vars},
+                 name=name,
+-                max_concurrency=self.max_concurrency,
++                #max_concurrency=self.max_concurrency,
+             ).remote(
+                 config=self.config,
+                 model_config=self.model_config,
