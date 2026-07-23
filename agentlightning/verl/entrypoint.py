@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, Type
 import hydra
 import ray
 from ray.actor import ActorClass
-from verl.trainer.main_ppo import create_rl_sampler
+from verl.trainer.main_ppo_sync import create_rl_sampler
 from verl.trainer.ppo.reward import load_reward_manager
 
 from agentlightning.adapter import TraceAdapter
@@ -102,116 +102,77 @@ class TaskRunner:
         from pprint import pprint
 
         from omegaconf import OmegaConf
-        from verl.utils.fs import copy_to_local
+        import transfer_queue as tq
 
         pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
         OmegaConf.resolve(config)
 
-        # download the checkpoint from hdfs
-        local_path = copy_to_local(config.actor_rollout_ref.model.path)
+        tq.init(config.transfer_queue)
 
-        # instantiate tokenizer
-        from verl.utils.tokenizer import hf_processor, hf_tokenizer
-
-        trust_remote_code = config.data.get("trust_remote_code", False)
-        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        processor = hf_processor(local_path, use_fast=True)  # used for multimodal LLM, could be none
-
+        lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
+        if lora_rank <= 0:
+            lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
+        ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
         # define worker classes
         from verl.single_controller.ray import RayWorkerGroup
         from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker
-        
-        # 这里verl.workers.fsdp_workers 和 verl.workers.megatron_workers 两个模块都被移除
-        # 直接使用ActorRolloutRefWorker通过model_engine去自动路由fsdp和megatron
-        actor_rollout_cls = ActorRolloutRefWorker
-        # 这里RayWorkerGroup现在统一处理 FSDP 和 Megatron，不再需要 WorkerGroup 层面区分
-        ray_worker_group_cls = RayWorkerGroup
 
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager
-        from verl.trainer.ppo.utils import Role
+        from verl.trainer.ppo.utils import Role,need_reference_policy,need_critic,is_distillation_enabled
 
-        # 这里查看是否需要注册refworker，如果需要的话也是三合一，原有的RefPolicy融合到ActorRolloutRef内部
-        if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
-            role = Role.ActorRolloutRef
-        else:
-            role = Role.ActorRollout
+        # role => worker class
+        role_worker_mapping = {}
+        # role => resource pool
+        mapping = {}
 
-        role_worker_mapping: dict[Role, ActorClass[Any]] = {
-            role: ray.remote(actor_rollout_cls),
-            Role.Critic: ray.remote(TrainingWorker),
-        }
+        role = Role.ActorRolloutRef if need_reference_policy(config) and not ref_in_actor else Role.ActorRollout
+        role_worker_mapping[role] = ray.remote(ActorRolloutRefWorker)
+        mapping[role] = "global_pool"
 
+        if need_critic(config):
+            role_worker_mapping[Role.Critic] = ray.remote(TrainingWorker)
+            mapping[Role.Critic] = "global_pool"
+
+        # Global resource pool is used for actor, rollout, critic, ref
         global_pool_id = "global_pool"
         resource_pool_spec = {
             global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
         }
-        mapping = {
-            role: global_pool_id,
-            Role.Critic: global_pool_id,
-        }
 
-        # 这里在verl v0.8.0中不再使用RewardModelWorker，同时reward_model配置重构到了reward.reward_model
-        # 需要在trainer.py中self.rm_wg.compute_rm_score(batch)，这个 rm_wg 是从 role_worker_mapping 里创建的 WorkerGroup
-        # 修改为 0.8.0 的 self.reward_loop_manager.compute_rm_score(batch)，并在 init_workers 中初始化 reward_loop_manager 而非 rm_wg
-        # 0.6.1：RewardModelWorker（FSDP/Megatron 各一个）→ 训练式推理 reward
-        # 0.8.0：RewardModelManager → 启动 rollout server 做 reward 推理，不再区分 FSDP/Megatron
-        if config.reward.reward_model.enable:
-            # 这里没有单独的RewardModelWorker
-            # role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
-            mapping[Role.RewardModel] = global_pool_id
+        # Add separate resource pool for reward model if enabled
+        if config.reward.reward_model.enable_resource_pool:
+            if config.reward.reward_model.n_gpus_per_node <= 0:
+                raise ValueError("config.reward.reward_model.n_gpus_per_node must be greater than 0")
+            if config.reward.reward_model.nnodes <= 0:
+                raise ValueError("config.reward.reward_model.nnodes must be greater than 0")
 
-        # use reference model
-        # 这里RefPolicy融合到ActorRolloutRef内部了，所以直接使用Role.ActorRollout
-        #if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
-        #    role_worker_mapping[Role.RefPolicy] = ray.remote(actor_rollout_cls)
-        #    mapping[Role.RefPolicy] = global_pool_id
+            reward_pool = [config.reward.reward_model.n_gpus_per_node] * config.reward.reward_model.nnodes
+            resource_pool_spec["reward_pool"] = reward_pool
+            mapping[Role.RewardModel] = "reward_pool"
+        else:
+            config.reward.reward_model.nnodes = config.trainer.nnodes
+            config.reward.reward_model.n_gpus_per_node = config.trainer.n_gpus_per_node
+            mapping[Role.RewardModel] = "global_pool"
 
-        # 0.8.0 中 reward 计算改由 RewardLoopManager 管理，该 manager 在 RayPPOTrainer.init_workers 中根据 config 自动创建
-        reward_fn = load_reward_manager(
-            config, tokenizer, **config.reward.reward_model.get("reward_kwargs", {})
-        )
-        val_reward_fn = load_reward_manager(
-            config, tokenizer, **config.reward.reward_model.get("reward_kwargs", {})
-        )
+        distillation_config = config.get("distillation")
+        if is_distillation_enabled(distillation_config):
+            if distillation_config.n_gpus_per_node <= 0:
+                raise ValueError("config.distillation.n_gpus_per_node must be greater than 0")
+            if distillation_config.nnodes <= 0:
+                raise ValueError("config.distillation.nnodes must be greater than 0")
+
+            teacher_pool = [distillation_config.n_gpus_per_node] * distillation_config.nnodes
+            resource_pool_spec["teacher_pool"] = teacher_pool
+            mapping[Role.TeacherModel] = "teacher_pool"
+
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
-        from verl.utils.dataset.rl_dataset import collate_fn
-
-        # Use our special dataset
-        if train_dataset is None:
-            train_dataset = AgentDataset(
-                data_files=config.data.train_files,
-                tokenizer=tokenizer,
-                processor=processor,
-                config=config.data,
-            )
-        else:
-            train_dataset = LoadedDataset(train_dataset)
-
-        if val_dataset is None:
-            val_dataset = AgentDataset(
-                data_files=config.data.val_files,
-                tokenizer=tokenizer,
-                processor=processor,
-                config=config.data,
-            )
-        else:
-            val_dataset = LoadedDataset(val_dataset)
-
-        train_sampler = create_rl_sampler(config.data, train_dataset)
         trainer = trainer_cls(
             config=config,
-            tokenizer=tokenizer,
-            processor=processor,
             role_worker_mapping=role_worker_mapping,
             resource_pool_manager=resource_pool_manager,
-            ray_worker_group_cls=ray_worker_group_cls,
-            reward_fn=reward_fn,
-            val_reward_fn=val_reward_fn,
             train_dataset=train_dataset,
             val_dataset=val_dataset,
-            collate_fn=collate_fn,
-            train_sampler=train_sampler,
             store=store,
             llm_proxy=llm_proxy,
             adapter=adapter,

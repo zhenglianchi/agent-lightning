@@ -16,7 +16,7 @@ import numpy as np
 import torch
 import verl
 from codetiming import Timer
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 from tqdm import tqdm
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
@@ -26,9 +26,9 @@ from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
 )
+from verl.trainer.main_ppo_sync import PPOTrainer
 from verl.trainer.ppo.ray_trainer import (
     AdvantageEstimator,
-    RayPPOTrainer,
     apply_kl_penalty,
     compute_advantage,
     compute_response_mask,
@@ -158,21 +158,14 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True, suffix: str 
     return metrics
 
 
-class AgentLightningTrainer(RayPPOTrainer):
+class AgentLightningTrainer(PPOTrainer):
     """
     Specialized PPO trainer for agent-based reinforcement learning.
 
     This trainer is designed specifically for scenarios where the model interacts with
     external environments, tools, or APIs through an AgentLightningServer. It simplifies
     the training loop by removing the complex conditional logic present in the original
-    RayPPOTrainer and focusing on the agent mode workflow.
-
-    Key differences from RayPPOTrainer:
-
-    1. Uses AgentModeDaemon for server communication
-    2. Simplified data flow without pop/union operations
-    3. Direct batch processing through agent daemon
-    4. Streamlined validation using agent_mode validation
+    PPOTrainer and focusing on the agent mode workflow.
     """
 
     def __init__(
@@ -181,17 +174,86 @@ class AgentLightningTrainer(RayPPOTrainer):
         llm_proxy: LLMProxy | None,
         adapter: TraceAdapter | None,
         daemon_cls: Type[AgentModeDaemon],
-        reward_fn=None,
-        val_reward_fn=None,
+        train_dataset=None,
+        val_dataset=None,
         **kwargs,
     ):
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
         super().__init__(**kwargs)
         self.store = store
         self.llm_proxy = llm_proxy
         self.adapter = adapter
         self.daemon_cls = daemon_cls
-        self.reward_fn = reward_fn
-        self.val_reward_fn = val_reward_fn
+
+    def _init_dataloader(self):
+        from verl.trainer.main_ppo_sync import create_rl_sampler
+        from verl.utils.dataset.rl_dataset import collate_fn
+        from torchdata.stateful_dataloader import StatefulDataLoader
+        from .dataset import AgentDataset, LoadedDataset
+
+        if self.train_dataset is not None:
+            self.train_dataset = LoadedDataset(self.train_dataset)
+        else:
+            self.train_dataset = AgentDataset(
+                data_files=self.config.data.train_files,
+                tokenizer=self.tokenizer,
+                processor=self.processor,
+                config=self.config.data,
+            )
+
+        if self.val_dataset is not None:
+            self.val_dataset = LoadedDataset(self.val_dataset)
+        else:
+            self.val_dataset = AgentDataset(
+                data_files=self.config.data.val_files,
+                tokenizer=self.tokenizer,
+                processor=self.processor,
+                config=self.config.data,
+            )
+
+        train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
+        num_workers = self.config.data["dataloader_num_workers"]
+
+        self.train_dataloader = StatefulDataLoader(
+            dataset=self.train_dataset,
+            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+            num_workers=num_workers,
+            drop_last=True,
+            collate_fn=collate_fn,
+            sampler=train_sampler,
+        )
+
+        val_batch_size = self.config.data.val_batch_size
+        if val_batch_size is None:
+            val_batch_size = len(self.val_dataset)
+
+        self.val_dataloader = StatefulDataLoader(
+            dataset=self.val_dataset,
+            batch_size=val_batch_size,
+            num_workers=num_workers,
+            shuffle=self.config.data.get("validation_shuffle", True),
+            drop_last=False,
+            collate_fn=collate_fn,
+        )
+
+        assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
+        assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
+
+        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
+        if self.config.trainer.total_training_steps is not None:
+            total_training_steps = self.config.trainer.total_training_steps
+        self.total_training_steps = total_training_steps
+
+        try:
+            OmegaConf.set_struct(self.config, True)
+            with open_dict(self.config):
+                if OmegaConf.select(self.config, "actor_rollout_ref.actor.optim"):
+                    self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
+                if OmegaConf.select(self.config, "critic.optim"):
+                    self.config.critic.optim.total_training_steps = total_training_steps
+        except Exception as e:
+            print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
     def _validate(self):
         assert len(self.val_dataloader) == 1, "Please set val_batch_size to None for better throughput."
@@ -430,6 +492,9 @@ class AgentLightningTrainer(RayPPOTrainer):
         return metrics
 
     def fit(self):
+        if self._dump_executor._shutdown:
+            self._init_dump_executor()
+            
         logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -437,11 +502,9 @@ class AgentLightningTrainer(RayPPOTrainer):
             config=OmegaConf.to_container(self.config, resolve=True),
         )
 
-        self.global_steps = 0
-
         # load checkpoint before doing anything
         self._load_checkpoint()
-        self.checkpoint_manager.update_weights(self.global_steps) 
+        self.checkpoint_manager.update_weights()
 
         assert self.async_rollout_mode, "If agent mode is enabled, async server must be enabled"
         if self.adapter is not None and not isinstance(self.adapter, TraceToTripletBase):
@@ -469,14 +532,13 @@ class AgentLightningTrainer(RayPPOTrainer):
         )
         self.agent_mode_daemon.start()
 
-        # perform validation before training
-        # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+        if self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
+                self._shutdown_dump_executor()
                 return
 
         # add tqdm
