@@ -18,6 +18,8 @@ import verl
 from codetiming import Timer
 from omegaconf import DictConfig, OmegaConf, open_dict
 from tqdm import tqdm
+import transfer_queue as tq
+from transfer_queue import KVBatchMeta
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.trainer.ppo.core_algos import agg_loss
@@ -273,16 +275,13 @@ class AgentLightningTrainer(PPOTrainer):
         self.checkpoint_manager.sleep_replicas()
         return test_metrics
 
-    def _train_step(self, batch_dict: dict) -> dict:
+    def _train_step(self, batch_dict: dict, metrics: dict, timing_raw: dict) -> KVBatchMeta:
         # Isolate in a separate method to automatically recycle the variables before validation.
         batch: DataProto = DataProto.from_single_dict(batch_dict)
-        
-        metrics = {}
-        timing_raw = {}
 
         with _timer("step", timing_raw):
 
-            # When agent mode is enabled, we read the batch as it is.
+            # ===== 1. Rollout（daemon替代async_rollout_manager） =====
             gen_batch = batch
 
             # generate a batch
@@ -292,7 +291,9 @@ class AgentLightningTrainer(PPOTrainer):
                     gen_batch.non_tensor_batch, self.llm_server_manager.get_addresses()
                 )
                 self.agent_mode_daemon.run_until_all_finished()
+                # 这里修改以后返回的已经是KVBatchMeta了
                 batch, agent_metrics = self.agent_mode_daemon.get_train_data_batch(
+                    partition_id="train",
                     max_prompt_length=(
                         self.config.agentlightning.trace_aggregator.trajectory_max_prompt_length
                         if self.config.agentlightning.trace_aggregator.level.startswith("trajectory")
@@ -310,6 +311,7 @@ class AgentLightningTrainer(PPOTrainer):
                 self.agent_mode_daemon.clear_data_and_server()
                 self.checkpoint_manager.sleep_replicas()
 
+            '''
             if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                 with _timer("gen_max", timing_raw):
                     gen_baseline_batch = deepcopy(gen_batch)
@@ -328,168 +330,81 @@ class AgentLightningTrainer(PPOTrainer):
 
             # uid is used for algorithm like GRPO, should be aligned to data id
             batch.non_tensor_batch["uid"] = batch.non_tensor_batch["data_id_list"]
-            
 
+            
             if "response_mask" not in batch.batch:
                 batch.batch["response_mask"] = compute_response_mask(batch)
 
             # compute global_valid tokens
             batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
             batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+            '''
 
             with _timer("reward", timing_raw):
                 # compute reward model score
-                if self.use_rm:
-                    reward_tensor = self.reward_loop_manager.compute_rm_score(batch)
-                    batch = batch.union(reward_tensor)
+                if self.reward_loop_manager.reward_loop_worker_handles is None:
+                    # 这里是todo，目前verl0.8.0中也没做
+                    batch = self._compute_reward_colocate(batch)
 
-                reward_extra_infos_dict = {}
-            # for agent mode, pad the lengths to calculate old log prob, ref, and values
-            print("padding before: ",batch.batch.batch_size)
-            micro_bsz = self.config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
-            divisor = self.actor_rollout_wg.world_size * micro_bsz
-            batch, pad_size = pad_dataproto_to_divisor(batch, divisor)
-            print("padding: ",batch.batch.batch_size)
-            # recompute old_log_probs
-            with _timer("old_log_prob", timing_raw):
-                old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
-                entropys = old_log_prob.batch["entropys"]
-                response_masks = batch.batch["response_mask"]
-                loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                old_log_prob_metrics = {
-                    "actor/entropy": entropy_loss.detach().item(),
-                    "perf/mfu/actor_infer": old_log_prob_mfu,
-                }
-                metrics.update(old_log_prob_metrics)
-                old_log_prob.batch.pop("entropys")
-                batch = batch.union(old_log_prob)
+            '''if self.config.algorithm.adv_estimator == core_algos.AdvantageEstimator.REMAX:
+                batch = self._add_remax_reward_baselines(batch)'''
 
-            if self.use_reference_policy:
-                # compute reference log_prob
-                with _timer("ref", timing_raw):
-                    ref_log_prob = self._compute_ref_log_prob(batch)
-                    batch = batch.union(ref_log_prob)
-
-            # compute values
-            if self.use_critic:
-                with _timer("values", timing_raw):
-                    values = self._compute_values(batch)
-                    batch = batch.union(values)
-
-            # for agent mode, unpad to calculate adv
-            # it is important, as adv should be based on the raw traces
-            batch = unpad_dataproto(batch, pad_size=pad_size)
-            print("unpad: ", batch.batch.batch_size)
-
-            with _timer("adv", timing_raw):
-                # if agent_mode is enabled, there is already token_level_scores
-                # token_level_scores is not needed to compute here
-
-                # compute rewards. apply_kl_penalty if available
-                if self.config.algorithm.use_kl_in_reward:
-                    batch, kl_metrics = apply_kl_penalty(
-                        batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
-                    )
-                    metrics.update(kl_metrics)
-                else:
-                    batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
-                # compute advantages, executed on the driver process
-
-                norm_adv_by_std_in_grpo = self.config.algorithm.get(
-                    "norm_adv_by_std_in_grpo", True
-                )  # GRPO adv normalization factor
-
-                batch = compute_advantage(
-                    batch,
-                    adv_estimator=self.config.algorithm.adv_estimator,
-                    gamma=self.config.algorithm.gamma,
-                    lam=self.config.algorithm.lam,
-                    num_repeat=self.config.actor_rollout_ref.rollout.n,
-                    norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                    config=self.config.algorithm,
+            # ===== 2. 过滤is_drop样本（替代原来的is_drop_mask过滤） =====
+            non_drop_mask = [not tag.get("is_drop", False) for tag in batch.tags]
+            if not all(non_drop_mask):
+                valid_indices = [i for i, m in enumerate(non_drop_mask) if m]
+                metrics["training/n_triplets_prompt_too_long"] = len(batch.keys) - len(valid_indices)
+                print("valid_indices: ", len(valid_indices))
+                batch = KVBatchMeta(
+                    keys=[batch.keys[i] for i in valid_indices],
+                    tags=[batch.tags[i] for i in valid_indices],
+                    partition_id=batch.partition_id,
+                    fields=batch.fields,
+                    extra_info=batch.extra_info,
                 )
 
-            # Calculate the metrics before processing. Refer to the comments of function `compute_data_metrics` for details.
-            metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic, suffix="_before_processing"))
+            # ===== 3. Balance batch（替代pad/unpad/floor_pad） =====
+            # _balance_batch 内部会 upsample + 负载均衡
+            # upsample 复制已有样本作为padding，tag标记 is_padding=True
+            # 不再需要手动 pad → compute → unpad → floor_pad
+            batch = self._balance_batch(batch, metrics=metrics)
 
-            # after advantages are assigned, we begin to drop (1) long prompt (2) floor to ppo minisize
-            keep_indices = (~batch.batch["is_drop_mask"]).nonzero(as_tuple=True)[0]
-            metrics["training/n_triplets_prompt_too_long"] = (
-                batch.batch["is_drop_mask"].shape[0] - keep_indices.shape[0]
-            )
-            batch = batch[keep_indices]
-            print("drop_prompt: ",batch.batch.batch_size)
-            ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-            rollout_n = self.config.actor_rollout_ref.rollout.n
-            per_gpu_divisor = self.actor_rollout_wg.world_size * (ppo_mini_batch_size * rollout_n // self.actor_rollout_wg.world_size)
-            n_transition = len(batch)
-            random_indices = list(range(n_transition))
-            random.shuffle(random_indices)
-            batch.reorder(torch.tensor(random_indices).type(torch.int32))
-            if n_transition % per_gpu_divisor != 0:
-                floor_pad_size = per_gpu_divisor - n_transition % per_gpu_divisor
-                batch, _ = pad_dataproto_to_divisor(batch, per_gpu_divisor)
-                batch.batch["response_mask"][-floor_pad_size:] = 0
-                if "token_level_rewards" in batch.batch:
-                    batch.batch["token_level_rewards"][-floor_pad_size:] = 0
-                if "advantages" in batch.batch:
-                    batch.batch["advantages"][-floor_pad_size:] = 0
-            else:
-                floor_pad_size = 0
-            print("floor pad: ", batch.batch.batch_size, "pad_size: ", floor_pad_size)
-            metrics["training/n_triplets_padded_remainder"] = floor_pad_size
+            print("padding: ", len(batch.tags))
 
-            # Agent mode note: Change the order of balance batch;
-            #     1. first calculate advantage
-            #     2. then drop the samples (too long prompt & floor to ppo minisize)
-            #     3. balance
-            # balance the number of valid tokens on each dp rank.
-            # Note that this breaks the order of data inside the batch.
-            # Please take care when you implement group based adv computation such as GRPO and rloo
-            if self.config.trainer.balance_batch:
-                self._balance_batch(batch, metrics=metrics)
+            # ===== 4. Compute old log prob =====
+            # PPOTrainer版：内部计算entropy，直接 metrics.update({"actor/entropy": ...})
+            # 不再需要手动从返回值提取 entropy
+            with _timer("old_log_prob", timing_raw):
+                batch = self._compute_old_log_prob(batch, metrics=metrics)
+
+            # ===== 5. Compute ref log prob =====
+            if self.use_reference_policy:
+                with _timer("ref", timing_raw):
+                    batch = self._compute_ref_log_prob(batch, metrics=metrics)
+
+            # ===== 6. Compute values =====
+            if self.use_critic:
+                with _timer("values", timing_raw):
+                    batch = self._compute_values(batch, metrics=metrics)
+
+            # ===== 7. Compute advantage =====
+            # PPOTrainer版：从TQ取数据 → 计算advantage → 写回TQ
+            # 不再需要手动 token_level_rewards = token_level_scores
+            with _timer("adv", timing_raw):
+                batch = self._compute_advantage(batch, metrics=metrics)
 
             # update critic
             if self.use_critic:
                 with _timer("update_critic", timing_raw):
-                    critic_output = self._update_critic(batch)
-                critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-                metrics.update(critic_output_metrics)
+                    batch = self._update_critic(batch, metrics=metrics)
 
             # implement critic warmup
             if self.config.trainer.critic_warmup <= self.global_steps:
                 # update actor
                 with _timer("update_actor", timing_raw):
-                    actor_output = self._update_actor(batch)
-                actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                metrics.update(actor_output_metrics)
+                    batch = self._update_actor(batch, metrics=metrics)
 
-            # Log rollout generations if enabled
-            rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-            if rollout_data_dir:
-                with _timer("dump_rollout_generations", timing_raw):
-                    print(batch.batch.keys())
-                    inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
-                    outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
-                    scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
-                    self._dump_generations(
-                        inputs=inputs,
-                        outputs=outputs,
-                        scores=scores,
-                        reward_extra_infos_dict=reward_extra_infos_dict,
-                        dump_path=rollout_data_dir,
-                    )
-
-        # compute training metrics
-        metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic, suffix="_after_processing"))
-        metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
-        # TODO: implement actual tflpo and theoretical tflpo
-        n_gpus = self.resource_pool_manager.get_n_gpus()
-        metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
-
-        return metrics
+        return batch
 
     def fit(self):
         if self._dump_executor._shutdown:
@@ -506,7 +421,6 @@ class AgentLightningTrainer(PPOTrainer):
         self._load_checkpoint()
         self.checkpoint_manager.update_weights()
 
-        assert self.async_rollout_mode, "If agent mode is enabled, async server must be enabled"
         if self.adapter is not None and not isinstance(self.adapter, TraceToTripletBase):
             raise ValueError("Adapter must be a TraceToTripletBase for currently VERL implementation.")
         
@@ -550,52 +464,58 @@ class AgentLightningTrainer(PPOTrainer):
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
-                metrics = {}
-                timing_raw = {}
+                metrics, timing_raw = {}, {}
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 # train step
-                metrics = self._train_step(batch_dict)
+                batch = self._train_step(batch_dict, metrics, timing_raw)
 
-                # validate
-                if (
-                    self.val_reward_fn is not None
-                    and self.config.trainer.test_freq > 0
-                    and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
-                ):
-                    with _timer("validate", timing_raw):
-                        val_metrics: dict = self._validate()
-                        if is_last_step:
-                            last_val_metrics = val_metrics
-                    metrics.update(val_metrics)
-
+                # save checkpoint
                 if self.config.trainer.save_freq > 0 and (
                     is_last_step or self.global_steps % self.config.trainer.save_freq == 0
                 ):
                     with _timer("save_checkpoint", timing_raw):
                         self._save_checkpoint()
 
-                # step metrics
-                metrics.update(
-                    {
-                        "training/global_step": self.global_steps,
-                        "training/epoch": epoch,
-                    }
-                )
+                # update weights from trainer to rollout
+                with _timer("update_weights", timing_raw):
+                    self.checkpoint_manager.update_weights()
+
+                # validate
+                if self.config.trainer.test_freq > 0 and (
+                    is_last_step or self.global_steps % self.config.trainer.test_freq == 0
+                ):
+                    with _timer("testing", timing_raw):
+                        val_metrics: dict = self._validate()
+                        if is_last_step:
+                            last_val_metrics = val_metrics
+                    metrics.update(val_metrics)
+
+                # record metrics
+                self._compute_metrics(batch, metrics, timing_raw, global_steps=self.global_steps, epoch=epoch)
+
+                # Log rollout generations if enabled
+                rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                if rollout_data_dir:
+                    with _timer("dump_rollout_generations", timing_raw):
+                        self._log_rollout_data(batch, timing_raw, rollout_data_dir)
+            
+                # cleanup transfer queue and replay buffer
+                tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
-
+                progress_bar.update(1)
+                self.global_steps += 1
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
-
+                    self._shutdown_dump_executor()
                     # This exit logic is to ensure a robust CI.
                     pprint(f"Flush the logger...")
                     del logger  # Make sure the loggers are flushed and closed properly
                     pprint(f"Training finished at step {self.global_steps}.")
                     return
 
-                progress_bar.update(1)
-                self.global_steps += 1
+        self._shutdown_dump_executor()

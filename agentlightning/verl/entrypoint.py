@@ -109,77 +109,80 @@ class TaskRunner:
 
         tq.init(config.transfer_queue)
 
-        lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
-        if lora_rank <= 0:
-            lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
-        ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
-        # define worker classes
-        from verl.single_controller.ray import RayWorkerGroup
-        from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker
+        try:
+            lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
+            if lora_rank <= 0:
+                lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
+            ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+            # define worker classes
+            from verl.single_controller.ray import RayWorkerGroup
+            from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker
 
-        from verl.trainer.ppo.ray_trainer import ResourcePoolManager
-        from verl.trainer.ppo.utils import Role,need_reference_policy,need_critic,is_distillation_enabled
+            from verl.trainer.ppo.ray_trainer import ResourcePoolManager
+            from verl.trainer.ppo.utils import Role,need_reference_policy,need_critic,is_distillation_enabled
 
-        # role => worker class
-        role_worker_mapping = {}
-        # role => resource pool
-        mapping = {}
+            # role => worker class
+            role_worker_mapping = {}
+            # role => resource pool
+            mapping = {}
 
-        role = Role.ActorRolloutRef if need_reference_policy(config) and not ref_in_actor else Role.ActorRollout
-        role_worker_mapping[role] = ray.remote(ActorRolloutRefWorker)
-        mapping[role] = "global_pool"
+            role = Role.ActorRolloutRef if need_reference_policy(config) and not ref_in_actor else Role.ActorRollout
+            role_worker_mapping[role] = ray.remote(ActorRolloutRefWorker)
+            mapping[role] = "global_pool"
 
-        if need_critic(config):
-            role_worker_mapping[Role.Critic] = ray.remote(TrainingWorker)
-            mapping[Role.Critic] = "global_pool"
+            if need_critic(config):
+                role_worker_mapping[Role.Critic] = ray.remote(TrainingWorker)
+                mapping[Role.Critic] = "global_pool"
 
-        # Global resource pool is used for actor, rollout, critic, ref
-        global_pool_id = "global_pool"
-        resource_pool_spec = {
-            global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
-        }
+            # Global resource pool is used for actor, rollout, critic, ref
+            global_pool_id = "global_pool"
+            resource_pool_spec = {
+                global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
+            }
 
-        # Add separate resource pool for reward model if enabled
-        if config.reward.reward_model.enable_resource_pool:
-            if config.reward.reward_model.n_gpus_per_node <= 0:
-                raise ValueError("config.reward.reward_model.n_gpus_per_node must be greater than 0")
-            if config.reward.reward_model.nnodes <= 0:
-                raise ValueError("config.reward.reward_model.nnodes must be greater than 0")
+            # Add separate resource pool for reward model if enabled
+            if config.reward.reward_model.enable_resource_pool:
+                if config.reward.reward_model.n_gpus_per_node <= 0:
+                    raise ValueError("config.reward.reward_model.n_gpus_per_node must be greater than 0")
+                if config.reward.reward_model.nnodes <= 0:
+                    raise ValueError("config.reward.reward_model.nnodes must be greater than 0")
 
-            reward_pool = [config.reward.reward_model.n_gpus_per_node] * config.reward.reward_model.nnodes
-            resource_pool_spec["reward_pool"] = reward_pool
-            mapping[Role.RewardModel] = "reward_pool"
-        else:
-            config.reward.reward_model.nnodes = config.trainer.nnodes
-            config.reward.reward_model.n_gpus_per_node = config.trainer.n_gpus_per_node
-            mapping[Role.RewardModel] = "global_pool"
+                reward_pool = [config.reward.reward_model.n_gpus_per_node] * config.reward.reward_model.nnodes
+                resource_pool_spec["reward_pool"] = reward_pool
+                mapping[Role.RewardModel] = "reward_pool"
+            else:
+                config.reward.reward_model.nnodes = config.trainer.nnodes
+                config.reward.reward_model.n_gpus_per_node = config.trainer.n_gpus_per_node
+                mapping[Role.RewardModel] = "global_pool"
 
-        distillation_config = config.get("distillation")
-        if is_distillation_enabled(distillation_config):
-            if distillation_config.n_gpus_per_node <= 0:
-                raise ValueError("config.distillation.n_gpus_per_node must be greater than 0")
-            if distillation_config.nnodes <= 0:
-                raise ValueError("config.distillation.nnodes must be greater than 0")
+            distillation_config = config.get("distillation")
+            if is_distillation_enabled(distillation_config):
+                if distillation_config.n_gpus_per_node <= 0:
+                    raise ValueError("config.distillation.n_gpus_per_node must be greater than 0")
+                if distillation_config.nnodes <= 0:
+                    raise ValueError("config.distillation.nnodes must be greater than 0")
 
-            teacher_pool = [distillation_config.n_gpus_per_node] * distillation_config.nnodes
-            resource_pool_spec["teacher_pool"] = teacher_pool
-            mapping[Role.TeacherModel] = "teacher_pool"
+                teacher_pool = [distillation_config.n_gpus_per_node] * distillation_config.nnodes
+                resource_pool_spec["teacher_pool"] = teacher_pool
+                mapping[Role.TeacherModel] = "teacher_pool"
 
-        resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+            resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
-        trainer = trainer_cls(
-            config=config,
-            role_worker_mapping=role_worker_mapping,
-            resource_pool_manager=resource_pool_manager,
-            train_dataset=train_dataset,
-            val_dataset=val_dataset,
-            store=store,
-            llm_proxy=llm_proxy,
-            adapter=adapter,
-            daemon_cls=daemon_cls,
-        )
-        trainer.init_workers()
-        trainer.fit()
+            trainer = trainer_cls(
+                config=config,
+                role_worker_mapping=role_worker_mapping,
+                resource_pool_manager=resource_pool_manager,
+                train_dataset=train_dataset,
+                val_dataset=val_dataset,
+                store=store,
+                llm_proxy=llm_proxy,
+                adapter=adapter,
+                daemon_cls=daemon_cls,
+            )
+            trainer.init_workers()
+            trainer.fit()
+        finally:
+            tq.close()
 
 
 if __name__ == "__main__":

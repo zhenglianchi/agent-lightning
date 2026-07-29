@@ -18,6 +18,9 @@ import torch
 from flask import Flask, Response, abort, request
 from tensordict import TensorDict
 from verl import DataProto
+from verl.utils.tensordict_utils import list_of_dict_to_tensordict
+import transfer_queue as tq
+from transfer_queue import KVBatchMeta
 
 from agentlightning import LLM, AgentLightningServer, NamedResources, RolloutLegacy
 from agentlightning.adapter.triplet import TracerTraceToTriplet, TraceToTripletBase
@@ -805,7 +808,7 @@ class AgentModeDaemon:
         return metric_dict
 
     def get_train_data_batch(
-        self, max_prompt_length: int, max_response_length: int, device: torch.device, global_steps: int
+        self, max_prompt_length: int, max_response_length: int, device: torch.device, global_steps: int, partition_id: str = "train"
     ):
         """
         Processes completed rollouts to generate a training data batch.
@@ -860,17 +863,19 @@ class AgentModeDaemon:
         #     discarded here. They are only truncated and marked, to be discarded later.
         #     This is for the correctness of the advantage calculation.
         #   - The discard for the PPO mini-batch should also be handled this way.
-        input_ids_list: List[List[int]] = []
-        input_attention_mask_list: List[List[int]] = []
-        response_ids_list: List[List[int]] = []
-        response_attention_mask_list: List[List[int]] = []
+        # TQ写入：直接构建unpadded变长tensor，无需先pad再unpad
+        # 逐样本收集原始数据，跳过padding步骤
         reward_list: List[float] = []
         data_id_list: List[str] = []
         rollout_id_list: List[str] = []
         turn_index_list: List[int] = []
         is_drop_list: List[bool] = []
-        image_grid_thw_list: List[Optional[torch.Tensor]] = []  # For Qwen2-VL mrope
+        image_grid_thw_list: List[Optional[torch.Tensor]] = []
         n_trunc_sample_because_of_response = 0
+        # 逐样本的unpadded原始数据，用于构建TQ的NestedTensor
+        raw_prompt_ids_list: List[List[int]] = []
+        raw_response_ids_list: List[List[int]] = []
+        raw_response_mask_list: List[List[int]] = []
 
         if self.trace_aggregator.get("level", "transition") == "transition":
             for rollout_id, sample_info in finished_id_to_sample_info.items():
@@ -879,35 +884,23 @@ class AgentModeDaemon:
                     reward_list.append(sample_info["reward"])
                     prompt_ids, response_ids = trace["prompt_ids"], trace["response_ids"]
 
-                    # Mark samples with prompts exceeding max_prompt_length to be dropped later
                     if len(prompt_ids) > max_prompt_length:
                         prompt_ids = prompt_ids[:max_prompt_length]
                         is_drop_list.append(True)
                     else:
                         is_drop_list.append(False)
 
-                    # Truncate responses that exceed max_response_length
                     if len(response_ids) > max_response_length:
                         response_ids = response_ids[:max_response_length]
                         n_trunc_sample_because_of_response += 1
 
-                    # Pad prompts to the left and responses to the right
-                    one_input_ids, one_input_attention_mask = get_left_padded_ids_and_attention_mask(
-                        prompt_ids, max_prompt_length, self.pad_token_id
-                    )
-                    one_response_ids, one_response_attention_mask = get_right_padded_ids_and_attention_mask(
-                        response_ids, max_response_length, self.pad_token_id
-                    )
-
-                    input_ids_list.append(one_input_ids)
-                    input_attention_mask_list.append(one_input_attention_mask)
-                    response_ids_list.append(one_response_ids)
-                    response_attention_mask_list.append(one_response_attention_mask)
+                    # 不再pad，直接保存原始变长数据
+                    raw_prompt_ids_list.append(prompt_ids)
+                    raw_response_ids_list.append(response_ids)
                     data_id_list.append(sample_info["data_id"])
                     rollout_id_list.append(rollout_id)
                     turn_index_list.append(turn_index)
 
-                    # Compute image_grid_thw for this triplet using image_urls from prompt
                     if self._use_mrope:
                         image_urls = trace.get("image_urls", [])
                         image_grid_thw_list.append(self._get_image_grid_thw(image_urls))
@@ -915,7 +908,6 @@ class AgentModeDaemon:
         elif self.trace_aggregator.get("level", "transition") == "trajectory":
             assert not self._use_mrope, "M-RoPE is not supported in trajectory level yet."
 
-            response_mask_list: List[List[int]] = []
             unmerged_count: int = 0
             template_mismatch_count, retoken_mismatch_count, others_mismatch_count = 0, 0, 0
             response_per_turn_list: List[int] = []
@@ -923,7 +915,6 @@ class AgentModeDaemon:
             for rollout_id, sample_info in finished_id_to_sample_info.items():
                 merged_trace_idx: List[List[int]] = []
 
-                # Identify which turns can be merged based on token ids prefix matching
                 current_merged_trace_idx: List[int] = []
                 current_context: List[int] = []
                 for turn_index, trace in enumerate(sample_info["trace_list"]):
@@ -962,11 +953,9 @@ class AgentModeDaemon:
                 if len(merged_trace_idx) > 1:
                     unmerged_count += 1
 
-                # Merge all trace segments in merged_trace_idx into training samples
                 for current_merged_trace_idx in merged_trace_idx:
                     prompt_ids = sample_info["trace_list"][current_merged_trace_idx[0]]["prompt_ids"]
 
-                    # if the merged_trace_idx doesn't start with the beginning of the prompt_ids, we need to adjust it
                     if current_merged_trace_idx[0] > 0 and len(prompt_ids) > max_prompt_length:
                         response_ids = prompt_ids[max_prompt_length:]
                         prompt_ids = prompt_ids[:max_prompt_length]
@@ -976,8 +965,9 @@ class AgentModeDaemon:
                         response_mask = []
 
                     prompt_length = len(prompt_ids)
-                    response_ids += sample_info["trace_list"][current_merged_trace_idx[0]]["response_ids"]
-                    response_mask += [1] * len(response_ids)
+                    first_turn_response = sample_info["trace_list"][current_merged_trace_idx[0]]["response_ids"]
+                    response_ids += first_turn_response
+                    response_mask += [1] * len(first_turn_response)
                     for turn_index in current_merged_trace_idx[1:]:
                         trace = sample_info["trace_list"][turn_index]
                         new_prompt_length = len(trace["prompt_ids"]) - len(response_ids) - prompt_length
@@ -988,108 +978,104 @@ class AgentModeDaemon:
 
                     reward_list.append(sample_info["reward"])
 
-                    # Mark samples with prompts exceeding max_prompt_length to be dropped later
                     if len(prompt_ids) > max_prompt_length:
                         prompt_ids = prompt_ids[:max_prompt_length]
                         is_drop_list.append(True)
                     else:
                         is_drop_list.append(False)
 
-                    # Truncate responses that exceed max_response_length
                     if len(response_ids) > max_response_length:
                         response_ids = response_ids[:max_response_length]
                         response_mask = response_mask[:max_response_length]
                         n_trunc_sample_because_of_response += 1
 
-                    # Pad prompts to the left and responses to the right
-                    one_input_ids, one_input_attention_mask = get_left_padded_ids_and_attention_mask(
-                        prompt_ids, max_prompt_length, self.pad_token_id
-                    )
-                    one_response_ids, one_response_attention_mask = get_right_padded_ids_and_attention_mask(
-                        response_ids, max_response_length, self.pad_token_id
-                    )
-                    one_response_mask, _ = get_right_padded_ids_and_attention_mask(
-                        response_mask, max_response_length, 0
-                    )
-
-                    input_ids_list.append(one_input_ids)
-                    input_attention_mask_list.append(one_input_attention_mask)
-                    response_ids_list.append(one_response_ids)
-                    response_attention_mask_list.append(one_response_attention_mask)
-                    response_mask_list.append(one_response_mask)
+                    # 不再pad，直接保存原始变长数据
+                    raw_prompt_ids_list.append(prompt_ids)
+                    raw_response_ids_list.append(response_ids)
+                    raw_response_mask_list.append(response_mask)
                     data_id_list.append(sample_info["data_id"])
                     rollout_id_list.append(rollout_id)
-                    # turn_index_list.append(current_merged_trace_idx)
         else:
             raise ValueError(f"Unknown trace_aggregator level: {self.trace_aggregator.get('level')}")
 
-        n_transition = len(input_ids_list)
-        batch_input_ids = torch.LongTensor(input_ids_list).to(device)
-        input_attention_mask = torch.LongTensor(input_attention_mask_list).to(device)
-        batch_response_ids = torch.LongTensor(response_ids_list).to(device)
-        response_attention_mask = torch.LongTensor(response_attention_mask_list).to(device)
-        response_mask = (
-            torch.LongTensor(response_mask_list).to(device) if self.trace_aggregator.get("level", "transition") == "trajectory" else None  # type: ignore
+        n_transition = len(raw_prompt_ids_list)
+
+        # 逐样本构建unpadded变长tensor，写入TQ时使用NestedTensor格式
+        # PPOTrainer._compute_metrics中data["prompts"].offsets().diff()依赖NestedTensor获取真实长度
+        fields_list = []
+        for i in range(n_transition):
+            prompt_ids = raw_prompt_ids_list[i]
+            response_ids = raw_response_ids_list[i]
+            seq_ids = prompt_ids + response_ids
+            prompt_len = len(prompt_ids)
+            response_len = len(response_ids)
+            seq_len = prompt_len + response_len
+
+            # token_level_scores: reward放在response最后一个token位置
+            token_level_scores_i = [0.0] * response_len
+            token_level_scores_i[-1] = reward_list[i]
+            token_level_scores_tensor = torch.tensor(token_level_scores_i, dtype=torch.float32).to(device)
+
+            # position_ids: unpadded序列全为真实token，等价于cumsum(all-1 mask) - 1
+            position_ids_i = torch.arange(seq_len, dtype=torch.long).to(device)
+
+            # mrope需要特殊处理position_ids
+            if self._use_mrope:
+                input_ids_tensor = torch.tensor([seq_ids], dtype=torch.long).to(device)
+                attention_mask_tensor = torch.ones(1, seq_len, dtype=torch.long).to(device)
+                image_grid_thw = image_grid_thw_list[i] if image_grid_thw_list else None
+                position_ids_i = self._compute_mrope_position_ids(
+                    input_ids=input_ids_tensor[0],
+                    attention_mask=attention_mask_tensor[0],
+                    image_grid_thw=image_grid_thw,
+                )
+
+            field = {
+                "prompts": torch.tensor(prompt_ids, dtype=torch.long).to(device),
+                "responses": torch.tensor(response_ids, dtype=torch.long).to(device),
+                "input_ids": torch.tensor(seq_ids, dtype=torch.long).to(device),
+                "attention_mask": torch.ones(seq_len, dtype=torch.long).to(device),
+                "position_ids": position_ids_i,
+                "token_level_scores": token_level_scores_tensor,
+                "uid": data_id_list[i],
+                "rm_scores": token_level_scores_tensor,
+                "num_turns": 1,
+            }
+
+            # response_mask/loss_mask：trajectory模式从trace生成，transition模式全1
+            if self.trace_aggregator.get("level") == "trajectory":
+                field["response_mask"] = torch.tensor(raw_response_mask_list[i], dtype=torch.long).to(device)
+                field["loss_mask"] = torch.tensor(raw_response_mask_list[i], dtype=torch.long).to(device)
+            else:
+                field["response_mask"] = torch.ones(response_len, dtype=torch.long).to(device)
+                field["loss_mask"] = torch.ones(response_len, dtype=torch.long).to(device)
+
+            fields_list.append(field)
+
+        # list_of_dict_to_tensordict: 变长tensor→NestedTensor(jagged), 非tensor→NonTensorStack
+        fields = list_of_dict_to_tensordict(fields_list)
+
+        # 生成唯一key：{data_id}_{rollout_id}_{turn_index}
+        keys = []
+        tags = []
+        for i in range(n_transition):
+            if self.trace_aggregator.get("level") == "transition":
+                key = f"{data_id_list[i]}_{rollout_id_list[i]}_{turn_index_list[i]}"
+            else:
+                key = f"{data_id_list[i]}_{rollout_id_list[i]}_{i}"
+            keys.append(key)
+            prompt_len = len(raw_prompt_ids_list[i])
+            response_len = len(raw_response_ids_list[i])
+            tags.append({"seq_len": prompt_len + response_len, "is_drop": is_drop_list[i]})
+
+        tq.kv_batch_put(keys=keys, partition_id=partition_id, fields=fields, tags=tags)
+
+        batch_meta = KVBatchMeta(
+            keys=keys,
+            tags=tags,
+            partition_id=partition_id,
+            fields=set(fields.keys()),
         )
-
-        # Concatenate prompts and responses to form the full sequence
-        batch_seq = torch.cat([batch_input_ids, batch_response_ids], dim=-1)
-        attention_mask = torch.cat([input_attention_mask, response_attention_mask], dim=-1)
-
-        # Compute position_ids - use mrope for Qwen2-VL, standard 2D otherwise
-        if self._use_mrope:
-            # For Qwen2-VL: compute 4D position_ids (batch_size, 4, seq_length)
-            position_ids_list: list[torch.Tensor] = []
-            for i in range(n_transition):
-                pos_ids = self._compute_mrope_position_ids(
-                    input_ids=batch_seq[i],
-                    attention_mask=attention_mask[i],
-                    image_grid_thw=image_grid_thw_list[i] if image_grid_thw_list else None,
-                )  # (4, seq_length)
-                position_ids_list.append(pos_ids)
-            # Stack to (batch_size, 4, seq_length)
-            position_ids = torch.stack(position_ids_list, dim=0)
-        else:
-            # Standard 2D position_ids (batch_size, seq_length)
-            position_ids = torch.clamp(torch.cumsum(attention_mask, dim=-1) - 1, min=0)
-
-        is_drop_mask = torch.BoolTensor(is_drop_list).to(device)
-        scores = torch.tensor(reward_list, dtype=torch.bfloat16).to(device)
-
-        # Create token-level scores by placing the final reward at the last token position
-        token_level_scores = torch.zeros_like(attention_mask, dtype=scores.dtype)
-        # For mrope (3D position_ids), use the first dimension (text position_ids) for eos calculation
-        if self._use_mrope:
-            # position_ids is (batch_size, 4, seq_length), use first dim for text positions
-            text_position_ids = position_ids[:, 0, :]  # (batch_size, seq_length)
-            eos_mask_idx = torch.argmax(text_position_ids * attention_mask, dim=-1)  # (bsz,)
-        else:
-            eos_mask_idx = torch.argmax(position_ids * attention_mask, dim=-1)  # (bsz,)
-        # At the eos_mask_idx position of each sample, fill in the corresponding scores.
-        # torch.arange(n_transition) generates [0,1,2,...,bsz-1] as indices for the batch dimension.
-        token_level_scores[torch.arange(n_transition), eos_mask_idx] = scores
-        # Only take the last response_length part of the sequence to get the token-level scores for the model's response part.
-        token_level_scores = token_level_scores[:, -max_response_length:]
-
-        # Form the final batch using TensorDict
-        batch = TensorDict(
-            {
-                "prompts": batch_input_ids,
-                "responses": batch_response_ids,
-                "input_ids": batch_seq,  # here input_ids become the whole sentences
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-                "is_drop_mask": is_drop_mask,
-                "token_level_scores": token_level_scores.contiguous(),
-                **(
-                    {"response_mask": response_mask}
-                    if self.trace_aggregator.get("level", "transition") == "trajectory"
-                    else {}
-                ),
-            },  # type: ignore
-            batch_size=n_transition,
-        )
-        data_proto = DataProto(batch=batch)
 
         data_metrics = {
             "training/reward": np.mean(list(finished_id_to_final_reward.values())),
@@ -1098,7 +1084,6 @@ class AgentModeDaemon:
             "training/n_rollouts_w_reward": sample_with_reward_count,
             "training/n_truncated_triplets": n_trunc_sample_because_of_response,
             "training/n_triplets": n_transition,
-            # log data, only for debug testing
             **(
                 {
                     "training/n_unmerged_rollouts": unmerged_count,  # type: ignore
@@ -1125,13 +1110,7 @@ class AgentModeDaemon:
             ),
         }
 
-        # Add non-tensor data for advantage calculation and logging
-        data_proto.non_tensor_batch["data_id_list"] = np.array(data_id_list)  # type: ignore
-        data_proto.non_tensor_batch["rollout_id_list"] = np.array(rollout_id_list)  # type: ignore
-        if self.trace_aggregator.get("level", "transition") == "transition":
-            data_proto.non_tensor_batch["turn_index_list"] = np.array(turn_index_list)  # type: ignore
-
-        return data_proto, data_metrics
+        return batch_meta, data_metrics
 
     def clear_data_and_server(self):
         """Resets the internal state of the daemon for the next run."""
