@@ -406,6 +406,11 @@ class AgentLightningTrainer(PPOTrainer):
 
         return batch
 
+    def _cleanup(self):
+        if hasattr(self, 'replay_buffer'):
+            self.replay_buffer.close()
+        self._shutdown_dump_executor()
+
     def fit(self):
         if self._dump_executor._shutdown:
             self._init_dump_executor()
@@ -446,76 +451,74 @@ class AgentLightningTrainer(PPOTrainer):
         )
         self.agent_mode_daemon.start()
 
-        if self.config.trainer.get("val_before_train", True):
-            val_metrics = self._validate()
-            assert val_metrics, f"{val_metrics=}"
-            pprint(f"Initial validation metrics: {val_metrics}")
-            logger.log(data=val_metrics, step=self.global_steps)
-            if self.config.trainer.get("val_only", False):
-                self._shutdown_dump_executor()
-                return
-
-        # add tqdm
-        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
-
-        # we start from step 1
-        self.global_steps += 1
-        last_val_metrics = None
-
-        for epoch in range(self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
-                metrics, timing_raw = {}, {}
-
-                is_last_step = self.global_steps >= self.total_training_steps
-
-                # train step
-                batch = self._train_step(batch_dict, metrics, timing_raw)
-
-                # save checkpoint
-                if self.config.trainer.save_freq > 0 and (
-                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0
-                ):
-                    with _timer("save_checkpoint", timing_raw):
-                        self._save_checkpoint()
-
-                # update weights from trainer to rollout
-                with _timer("update_weights", timing_raw):
-                    self.checkpoint_manager.update_weights()
-
-                # validate
-                if self.config.trainer.test_freq > 0 and (
-                    is_last_step or self.global_steps % self.config.trainer.test_freq == 0
-                ):
-                    with _timer("testing", timing_raw):
-                        val_metrics: dict = self._validate()
-                        if is_last_step:
-                            last_val_metrics = val_metrics
-                    metrics.update(val_metrics)
-
-                # record metrics
-                self._compute_metrics(batch, metrics, timing_raw, global_steps=self.global_steps, epoch=epoch)
-
-                # Log rollout generations if enabled
-                rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                if rollout_data_dir:
-                    with _timer("dump_rollout_generations", timing_raw):
-                        self._log_rollout_data(batch, timing_raw, rollout_data_dir)
-            
-                # cleanup transfer queue and replay buffer
-                tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
-
-                # TODO: make a canonical logger that supports various backend
-                logger.log(data=metrics, step=self.global_steps)
-                progress_bar.update(1)
-                self.global_steps += 1
-                if is_last_step:
-                    pprint(f"Final validation metrics: {last_val_metrics}")
-                    progress_bar.close()
-                    self._shutdown_dump_executor()
-                    # This exit logic is to ensure a robust CI.
-                    pprint(f"Flush the logger...")
-                    del logger  # Make sure the loggers are flushed and closed properly
-                    pprint(f"Training finished at step {self.global_steps}.")
+        try:
+            if self.config.trainer.get("val_before_train", True):
+                val_metrics = self._validate()
+                assert val_metrics, f"{val_metrics=}"
+                pprint(f"Initial validation metrics: {val_metrics}")
+                logger.log(data=val_metrics, step=self.global_steps)
+                if self.config.trainer.get("val_only", False):
                     return
 
-        self._shutdown_dump_executor()
+            # add tqdm
+            progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+
+            # we start from step 1
+            self.global_steps += 1
+            last_val_metrics = None
+
+            for epoch in range(self.config.trainer.total_epochs):
+                for batch_dict in self.train_dataloader:
+                    metrics, timing_raw = {}, {}
+
+                    is_last_step = self.global_steps >= self.total_training_steps
+
+                    # train step
+                    batch = self._train_step(batch_dict, metrics, timing_raw)
+
+                    # save checkpoint
+                    if self.config.trainer.save_freq > 0 and (
+                        is_last_step or self.global_steps % self.config.trainer.save_freq == 0
+                    ):
+                        with _timer("save_checkpoint", timing_raw):
+                            self._save_checkpoint()
+
+                    # update weights from trainer to rollout
+                    with _timer("update_weights", timing_raw):
+                        self.checkpoint_manager.update_weights()
+
+                    # validate
+                    if self.config.trainer.test_freq > 0 and (
+                        is_last_step or self.global_steps % self.config.trainer.test_freq == 0
+                    ):
+                        with _timer("testing", timing_raw):
+                            val_metrics: dict = self._validate()
+                            if is_last_step:
+                                last_val_metrics = val_metrics
+                        metrics.update(val_metrics)
+
+                    # record metrics
+                    self._compute_metrics(batch, metrics, timing_raw, global_steps=self.global_steps, epoch=epoch)
+
+                    # Log rollout generations if enabled
+                    rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                    if rollout_data_dir:
+                        with _timer("dump_rollout_generations", timing_raw):
+                            self._log_rollout_data(batch, timing_raw, rollout_data_dir)
+                
+                    # cleanup transfer queue and replay buffer
+                    tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
+
+                    # TODO: make a canonical logger that supports various backend
+                    logger.log(data=metrics, step=self.global_steps)
+                    progress_bar.update(1)
+                    self.global_steps += 1
+                    if is_last_step:
+                        pprint(f"Final validation metrics: {last_val_metrics}")
+                        progress_bar.close()
+                        pprint(f"Flush the logger...")
+                        del logger
+                        pprint(f"Training finished at step {self.global_steps}.")
+                        return
+        finally:
+            self._cleanup()
