@@ -31,7 +31,7 @@
     {
       "path": "actor_rollout_ref.model.path",
       "template": "${MODEL_PATH}",
-      "default": "/data/nfs/model/Qwen3-8B"
+      "default": "/home/ma-user/qwen3-8B"
     },
     {
       "path": "actor_rollout_ref.actor.optim.lr",
@@ -103,7 +103,7 @@
       "path": "trainer.save_freq",
       "template": "${SAVE_FREQ}",
       "type": "int",
-      "default": 100
+      "default": -1
     },
     {
       "path": "trainer.test_freq",
@@ -121,6 +121,31 @@
       "path": "trainer.default_local_dir",
       "template": "${LOCAL_MODEL_OUTPUT}",
       "default": "/home/ma-user/modelarts/output"
+    },
+    {
+      "path": "transfer_queue.enable",
+      "default": true,
+      "type": "bool"
+    },
+    {
+      "path": "transfer_queue.metrics.enabled",
+      "default": true,
+      "type": "bool"
+    },
+    {
+      "path": "transfer_queue.backend.storage_backend",
+      "default": "SimpleStorage",
+      "type": "str"
+    },
+    {
+      "path": "transfer_queue.backend.SimpleStorage.total_storage_size",
+      "default": 100000,
+      "type": "int"
+    },
+    {
+      "path": "transfer_queue.backend.SimpleStorage.num_data_storage_units",
+      "default": 8,
+      "type": "int"
     }
   ],
   "fixed": {
