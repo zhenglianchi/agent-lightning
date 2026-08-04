@@ -55,7 +55,6 @@ from agentlightning.utils.server_launcher import (
     PythonServerLauncherArgs,
     noop_context,
 )
-
 from .store.base import LightningStore
 
 logger = logging.getLogger(__name__)
@@ -318,6 +317,7 @@ class LightningSpanExporter(SpanExporter):
 
         return SpanExportResult.SUCCESS
 
+
     def _maybe_flush(self):
         """Flush ready subtrees from the buffer.
 
@@ -438,6 +438,22 @@ class LightningSpanExporter(SpanExporter):
                     fut = asyncio.run_coroutine_threadsafe(add_otel_span_task, loop)
                     fut.result()  # Bubble up any exceptions from the coroutine.
 
+            # ===== 方案4：累积 spans（不调 adapter），等待 /tq/reward 时一次性 adapt =====
+            proxy = get_active_llm_proxy()
+            if getattr(proxy, "_adapter", None) is not None and rollout_id:
+                try:
+                    from agentlightning.types.tracer import Span as AglSpan
+                    source_normalized = [
+                        AglSpan.from_opentelemetry(span, rollout_id, attempt_id, sequence_id_decimal)
+                        if isinstance(span, ReadableSpan) else span
+                        for span in subtree_spans
+                    ]
+                    with proxy._pending_spans_lock:
+                        proxy._pending_spans.setdefault(rollout_id, []).extend(source_normalized)
+                    print(f"[TQ4-DEBUG] _maybe_flush: accumulated {len(source_normalized)} spans for rollout_id={rollout_id}, total pending={len(proxy._pending_spans[rollout_id])}")
+                except Exception as e:
+                    logger.warning(f"Failed to accumulate spans for rollout {rollout_id}: {e}")
+
     def _get_root_span_ids(self) -> Iterable[int]:
         """Yield span_ids for root spans currently in the buffer.
 
@@ -550,10 +566,11 @@ class RolloutAttemptMiddleware(BaseHTTPMiddleware):
         path = request.url.path
 
         match = re.match(r"^/rollout/([^/]+)/attempt/([^/]+)(/.*)?$", path)
+
         if match:
             rollout_id = match.group(1)
             attempt_id = match.group(2)
-            new_path = match.group(3) if match.group(3) is not None else "/"
+            new_path = match.group(3) if match.group(3) else "/"
 
             # Rewrite the ASGI scope path so downstream sees a clean OpenAI path.
             request.scope["path"] = new_path
@@ -564,7 +581,6 @@ class RolloutAttemptMiddleware(BaseHTTPMiddleware):
                 # Allocate a monotonic sequence id per (rollout, attempt).
                 sequence_id = await store.get_next_span_sequence_id(rollout_id, attempt_id)
 
-                # Inject headers so downstream components and exporters can retrieve them.
                 request.scope["headers"] = list(request.scope["headers"]) + [
                     (b"x-rollout-id", rollout_id.encode()),
                     (b"x-attempt-id", attempt_id.encode()),
@@ -1074,8 +1090,25 @@ class LLMProxy:
         launcher_args: PythonServerLauncherArgs | None = None,
         middlewares: Sequence[Union[Type[BaseHTTPMiddleware], str]] | None = None,
         callbacks: Sequence[Union[Type[CustomLogger], str]] | None = None,
+        adapter: Optional[Any] = None,
+        max_prompt_length: Optional[int] = None,
+        max_response_length: Optional[int] = None,
     ):
         self.store = store
+        self._adapter: Optional[Any] = adapter
+        self._pending_spans: Dict[str, List[Any]] = {}
+        self._pending_spans_lock = threading.Lock()
+        self._max_prompt_length: Optional[int] = max_prompt_length
+        self._max_response_length: Optional[int] = max_response_length
+
+        # 方案4：初始化 TQ
+        import transfer_queue as tq
+        tq.init()
+        print(f"[TQ4-DEBUG] LLMProxy.__init__: adapter={adapter is not None}, max_prompt_length={max_prompt_length}, max_response_length={max_response_length}, tq.init() done")
+
+        # 方案4：注册 /tq/reward 端点
+        self._register_tq_reward_endpoint()
+        print(f"[TQ4-DEBUG] LLMProxy.__init__: _register_tq_reward_endpoint() done")
 
         if launcher_args is not None and (
             port is not None or host is not None or launch_mode != "mp" or num_workers != 1
@@ -1129,9 +1162,8 @@ class LLMProxy:
                         f"Invalid callback alias: {callback}. Available aliases are: {list(_CALLBACK_REGISTRY.keys())}"
                     )
                 callback = _CALLBACK_REGISTRY[callback]
-                self.callbacks.append(callback)
-            else:
-                self.callbacks.append(callback)
+
+            self.callbacks.append(callback)
 
     def get_store(self) -> Optional[LightningStore]:
         """Get the store used by the proxy.
@@ -1201,6 +1233,125 @@ class LLMProxy:
             # If it's not the first time to initialize the callbacks, also
             # reset LiteLLM's logging worker so its asyncio.Queue binds to the new loop.
             _reset_litellm_logging_worker()
+
+    def _register_tq_reward_endpoint(self):
+        """注册 /tq/reward FastAPI 路由，接收 reward 并写 TQ。"""
+        from fastapi import Request
+        from verl.utils.tensordict_utils import list_of_dict_to_tensordict
+        import torch
+        import transfer_queue as tq
+
+        proxy_self = self
+
+        @app.post("/tq/reward")
+        async def tq_reward(request: Request):
+            body = await request.json()
+            rollout_id = body["rollout_id"]
+            global_steps = body["global_steps"]
+            reward = body["reward"]
+            data_id = body["data_id"]
+            max_prompt_length = proxy_self._max_prompt_length
+            max_response_length = proxy_self._max_response_length
+            print(f"[TQ4-DEBUG] /tq/reward received: rollout_id={rollout_id}, data_id={data_id}, global_steps={global_steps}, reward={reward}")
+
+            # 1. 取累积的 spans，一次性调用 adapter（与 enableTQ 分支行为一致）
+            with proxy_self._pending_spans_lock:
+                spans = proxy_self._pending_spans.pop(rollout_id, [])
+            print(f"[TQ4-DEBUG] /tq/reward: popped {len(spans)} spans for rollout_id={rollout_id}")
+            if not spans:
+                logger.warning(f"/tq/reward: No cached spans for rollout {rollout_id}, writing finished barrier only.")
+                tq.kv_put(
+                    key=rollout_id,
+                    partition_id="train",
+                    tag={"global_steps": global_steps, "status": "finished"},
+                )
+                return {"status": "ok", "warning": "no_cached_spans"}
+
+            # 2. 一次性 adapt 所有 spans → triplets
+            triplets = proxy_self._adapter.adapt(spans)
+            print(f"[TQ4-DEBUG] /tq/reward: adapter produced {len(triplets)} triplets")
+            if not triplets:
+                logger.warning(f"/tq/reward: Adapter returned empty triplets for rollout {rollout_id}, writing finished barrier only.")
+                tq.kv_put(
+                    key=rollout_id,
+                    partition_id="train",
+                    tag={"global_steps": global_steps, "status": "finished"},
+                )
+                return {"status": "ok", "warning": "empty_triplets"}
+
+            # 3. 构建 fields（transition 模式：每个 triplet 独立一条数据）
+            keys, tags, fields_list = [], [], []
+            for turn_index, triplet in enumerate(triplets):
+                prompt_ids = triplet.prompt.get("token_ids", [])
+                response_ids = triplet.response.get("token_ids", [])
+                if not prompt_ids or not response_ids:
+                    continue
+
+                is_drop = max_prompt_length is not None and len(prompt_ids) > max_prompt_length
+
+                if max_prompt_length:
+                    prompt_ids = prompt_ids[:max_prompt_length]
+                if max_response_length:
+                    response_ids = response_ids[:max_response_length]
+
+                seq_ids = prompt_ids + response_ids
+                prompt_len = len(prompt_ids)
+                response_len = len(response_ids)
+                seq_len = prompt_len + response_len
+
+                # reward 放在 response 最后一个 token
+                token_level_scores = [0.0] * response_len
+                token_level_scores[-1] = reward
+                token_level_scores_tensor = torch.tensor(token_level_scores, dtype=torch.float32)
+
+                field = {
+                    "prompts": torch.tensor(prompt_ids, dtype=torch.long),
+                    "responses": torch.tensor(response_ids, dtype=torch.long),
+                    "input_ids": torch.tensor(seq_ids, dtype=torch.long),
+                    "attention_mask": torch.ones(seq_len, dtype=torch.long),
+                    "position_ids": torch.arange(seq_len, dtype=torch.long),
+                    "token_level_scores": token_level_scores_tensor,
+                    "rm_scores": token_level_scores_tensor,
+                    "response_mask": torch.ones(response_len, dtype=torch.long),
+                    "loss_mask": torch.ones(response_len, dtype=torch.long),
+                    "uid": data_id,
+                    "num_turns": 1,
+                }
+
+                key = f"{data_id}_{rollout_id}_{turn_index}"
+                keys.append(key)
+                tags.append({
+                    "global_steps": global_steps,
+                    "status": "success",
+                    "seq_len": seq_len,
+                    "is_drop": is_drop,
+                })
+                fields_list.append(field)
+
+            # 4. 写 TQ 数据 keys（用 async 版本避免阻塞事件循环）
+            if fields_list:
+                print(f"[TQ4-DEBUG] /tq/reward: building tensordict from {len(fields_list)} fields")
+                fields = list_of_dict_to_tensordict(fields_list)
+                print(f"[TQ4-DEBUG] /tq/reward: calling tq.async_kv_batch_put, keys={keys}")
+                await tq.async_kv_batch_put(
+                    keys=keys,
+                    partition_id="train",
+                    fields=fields,
+                    tags=tags,
+                )
+                print(f"[TQ4-DEBUG] /tq/reward: wrote {len(fields_list)} data keys to TQ, keys={keys}")
+
+            # 5. 写 uid barrier（通知 ReplayBuffer 该 rollout 已完成）
+            print(f"[TQ4-DEBUG] /tq/reward: calling tq.async_kv_put finished barrier for rollout_id={rollout_id}")
+            await tq.async_kv_put(
+                key=rollout_id,
+                partition_id="train",
+                tag={"global_steps": global_steps, "status": "finished"},
+            )
+            print(f"[TQ4-DEBUG] /tq/reward: wrote finished barrier for rollout_id={rollout_id}")
+
+            return {"status": "ok", "triplets_written": len(fields_list)}
+    
 
     @asynccontextmanager
     async def _serve_context(self) -> AsyncGenerator[None, None]:

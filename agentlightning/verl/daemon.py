@@ -230,6 +230,8 @@ class AgentModeDaemon:
         processor: Any = None,
         image_base_dir: Optional[str] = None,
         trace_aggregator: Dict[str, Any] = {"level": "transition"},
+        max_prompt_length: Optional[int] = None,
+        max_response_length: Optional[int] = None,
     ):
         self.mode = mode
         self.llm_timeout_seconds = llm_timeout_seconds
@@ -246,19 +248,19 @@ class AgentModeDaemon:
             assert store is not None
             self.store = store
             if llm_proxy is None:
+                resolved_adapter = adapter if adapter is not None else TracerTraceToTriplet()
                 self.llm_proxy = LLMProxy(
                     port=_find_available_port(),
                     model_list=[],
                     store=store,
+                    adapter=resolved_adapter,
+                    max_prompt_length=max_prompt_length,
+                    max_response_length=max_response_length,
                 )
             else:
                 # Reuse the existing LLM proxy (probably configured by user)
                 self.llm_proxy = llm_proxy
-            if adapter is None:
-                self.adapter = TracerTraceToTriplet()
-            else:
-                # Reuse the one from trainer
-                self.adapter = adapter
+            self.adapter = resolved_adapter if llm_proxy is None else (adapter if adapter is not None else TracerTraceToTriplet())
             self._internal_loop: Optional[asyncio.AbstractEventLoop] = None
             self._internal_loop_thread = threading.Thread(target=self._internal_loop_runner, daemon=True)
             self._internal_loop_thread.start()
@@ -273,6 +275,8 @@ class AgentModeDaemon:
         self.reward_fillna_value = reward_fillna_value
         self.image_base_dir = image_base_dir
         self.trace_aggregator = trace_aggregator
+        self._max_prompt_length = max_prompt_length
+        self._max_response_length = max_response_length
 
         # Check if model requires multimodal position_ids (e.g., Qwen2-VL)
         self._use_mrope = self._is_mrope_model()
@@ -500,7 +504,7 @@ class AgentModeDaemon:
             # Start proxy server in _async_set_up
             pass
 
-    async def _async_set_up(self, data: Dict[str, Any], server_addresses: List[str], is_train: bool = True):
+    async def _async_set_up(self, data: Dict[str, Any], server_addresses: List[str], is_train: bool = True, global_steps=None):
         """Async helper to set up data and resources on the server."""
         self.clear_data_and_server()
         if server_addresses != self.backend_llm_server_addresses:
@@ -551,6 +555,12 @@ class AgentModeDaemon:
             # Data ID is different from Rollout ID, as one data can have multiple rollouts.
             for _ in range(rollouts_per_sample):
                 task_metadata = {"data_id": data_id, "is_train": is_train}
+                if global_steps is not None:
+                    task_metadata["global_steps"] = global_steps
+                if self._max_prompt_length is not None:
+                    task_metadata["max_prompt_length"] = self._max_prompt_length
+                if self._max_response_length is not None:
+                    task_metadata["max_response_length"] = self._max_response_length
                 if self.mode == "v0":
                     # Queue immediately
                     rollout_id = await self.server.queue_task(
@@ -590,9 +600,18 @@ class AgentModeDaemon:
             )
             self._total_tasks_queued += len(rollouts)
 
-    def set_up_data_and_server(self, data: Dict[str, Any], server_addresses: List[str], is_train: bool = True):
+        if global_steps is not None and is_train:
+            import transfer_queue as tq
+            for rollout_id in self._task_id_to_original_sample:
+                tq.kv_put(
+                    key=rollout_id,
+                    partition_id="train",
+                    tag={"global_steps": global_steps, "status": "running"},
+                )
+
+    def set_up_data_and_server(self, data: Dict[str, Any], server_addresses: List[str], is_train: bool = True, global_steps: int = None):
         """Synchronous wrapper for setting up data and server resources."""
-        coro = self._async_set_up(data, server_addresses, is_train)
+        coro = self._async_set_up(data, server_addresses, is_train, global_steps=global_steps)
 
         if self.mode == "v0":
             if not self.server.loop or not self.server.startup_event.is_set():
@@ -675,6 +694,8 @@ class AgentModeDaemon:
 
     async def _async_run_until_finished(self, verbose: bool = True):
         """Async helper to wait for all tasks to complete."""
+        import time as _time
+        _wait_start = _time.time()
         while len(self._completed_rollouts_v0) < self._total_tasks_queued:
             if self.mode == "v0":
                 completed_batch = await self.server.retrieve_completed_rollouts()
@@ -695,10 +716,10 @@ class AgentModeDaemon:
                 else:
                     self._completed_rollouts_v0[rollout.rollout_id] = rollout
             if verbose:
-                print(f"Completed {len(self._completed_rollouts_v0)}/{self._total_tasks_queued} tasks...")
+                print(f"[TQ4-DEBUG] daemon: Completed {len(self._completed_rollouts_v0)}/{self._total_tasks_queued} tasks... (elapsed={_time.time()-_wait_start:.1f}s)")
             await asyncio.sleep(5)
 
-        print("All tasks finished.")
+        print(f"[TQ4-DEBUG] daemon: All tasks finished. (elapsed={_time.time()-_wait_start:.1f}s)")
 
     def run_until_all_finished(self, verbose: bool = True):
         """Synchronously waits for all queued tasks to be completed and reported."""

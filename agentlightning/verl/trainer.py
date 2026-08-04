@@ -286,32 +286,31 @@ class AgentLightningTrainer(PPOTrainer):
 
             # generate a batch
             with _timer("gen", timing_raw):
+                import time as _time
+                _t0 = _time.time()
                 self.checkpoint_manager.wake_up_replicas()
+                _t1 = _time.time()
+                # ===== 新逻辑：TQ 双写 =====
                 self.agent_mode_daemon.set_up_data_and_server(
-                    gen_batch.non_tensor_batch, self.llm_server_manager.get_addresses()
-                )
-                self.agent_mode_daemon.run_until_all_finished()
-                # 这里修改以后返回的已经是KVBatchMeta了
-                batch, agent_metrics = self.agent_mode_daemon.get_train_data_batch(
-                    partition_id="train",
-                    max_prompt_length=(
-                        self.config.agentlightning.trace_aggregator.trajectory_max_prompt_length
-                        if self.config.agentlightning.trace_aggregator.level.startswith("trajectory")
-                        else self.config.data.max_prompt_length
-                    ),
-                    max_response_length=(
-                        self.config.agentlightning.trace_aggregator.trajectory_max_response_length
-                        if self.config.agentlightning.trace_aggregator.level.startswith("trajectory")
-                        else self.config.data.max_response_length
-                    ),
-                    device=gen_batch.batch["fake_ids"].device,
+                    gen_batch.non_tensor_batch, self.llm_server_manager.get_addresses(),
                     global_steps=self.global_steps,
                 )
-                metrics.update(agent_metrics)
+                _t2 = _time.time()
+                batch = self.replay_buffer.sample(
+                    partition_id="train", global_steps=self.global_steps
+                )
+                _t3 = _time.time()
                 self.agent_mode_daemon.clear_data_and_server()
+                _t4 = _time.time()
                 self.checkpoint_manager.sleep_replicas()
+                _t5 = _time.time()
+                _msg = f"[BENCH-DUALWRITE] step={self.global_steps} gen breakdown: wake_replicas={_t1-_t0:.2f}s, set_up={_t2-_t1:.2f}s, replay_buffer.sample={_t3-_t2:.2f}s, clear={_t4-_t3:.2f}s, sleep_replicas={_t5-_t4:.2f}s, total_gen={_t5-_t0:.2f}s, n_triplets={len(batch.keys)}"
+                print(_msg)
+                with open("/home/ma-user/install/bench_dualwrite.txt", "a") as _f:
+                    _f.write(_msg + "\n")
 
             '''
+            TODO: 后续实现
             if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                 with _timer("gen_max", timing_raw):
                     gen_baseline_batch = deepcopy(gen_batch)
@@ -448,10 +447,26 @@ class AgentLightningTrainer(PPOTrainer):
             processor=self.processor,  # For Qwen2-VL mrope position_ids
             image_base_dir=getattr(self.config.data, "image_base_dir", None),
             trace_aggregator=self.config.agentlightning.trace_aggregator,
+            max_prompt_length=self.config.data.max_prompt_length,
+            max_response_length=self.config.data.max_response_length,
         )
         self.agent_mode_daemon.start()
 
+        from verl.trainer.main_ppo_sync import ReplayBuffer
+        self.replay_buffer = ReplayBuffer(poll_interval=1.0)
+
         try:
+            # 清理 TQ 残留数据（上次崩溃可能遗留 running barrier 等）
+            import transfer_queue as tq
+            all_data = tq.kv_list()
+            if all_data:
+                for partition_id, items in all_data.items():
+                    if items:
+                        tq.kv_clear(keys=list(items.keys()), partition_id=partition_id)
+                print(f"[TQ4-DEBUG] Cleared residual TQ data before training")
+            else:
+                print(f"[TQ4-DEBUG] TQ is clean before training")
+
             if self.config.trainer.get("val_before_train", True):
                 val_metrics = self._validate()
                 assert val_metrics, f"{val_metrics=}"
@@ -474,7 +489,14 @@ class AgentLightningTrainer(PPOTrainer):
                     is_last_step = self.global_steps >= self.total_training_steps
 
                     # train step
+                    import time as _time
+                    _step_t0 = _time.time()
                     batch = self._train_step(batch_dict, metrics, timing_raw)
+                    _step_t1 = _time.time()
+                    _msg = f"[BENCH-DUALWRITE] step={self.global_steps} total_train_step={_step_t1-_step_t0:.2f}s, timing={timing_raw}"
+                    print(_msg)
+                    with open("/home/ma-user/install/bench_dualwrite.txt", "a") as _f:
+                        _f.write(_msg + "\n")
 
                     # save checkpoint
                     if self.config.trainer.save_freq > 0 and (
@@ -485,7 +507,13 @@ class AgentLightningTrainer(PPOTrainer):
 
                     # update weights from trainer to rollout
                     with _timer("update_weights", timing_raw):
+                        _uw_t0 = _time.time()
                         self.checkpoint_manager.update_weights()
+                        _uw_t1 = _time.time()
+                        _msg = f"[BENCH-DUALWRITE] step={self.global_steps} update_weights={_uw_t1-_uw_t0:.2f}s"
+                        print(_msg)
+                        with open("/home/ma-user/install/bench_dualwrite.txt", "a") as _f:
+                            _f.write(_msg + "\n")
 
                     # validate
                     if self.config.trainer.test_freq > 0 and (

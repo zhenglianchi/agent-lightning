@@ -6,7 +6,7 @@ with latest Agent-lightning API (v0.2+)."""
 import asyncio
 import os
 import re
-from typing import TypedDict, cast
+from typing import TypedDict, cast, Dict, Any
 
 from autogen_agentchat.agents import AssistantAgent
 from autogen_core.models import ModelFamily
@@ -55,6 +55,7 @@ def autogen_assistant_agent(
 
     calc_agent = AssistantAgent(
         name="calc",
+        system_message="You are a helpful AI assistant. You MUST use the calculate tool for ALL arithmetic operations. Never compute results yourself. Always call the calculate tool and report its result. Reply with TERMINATE when the task has been completed.",
         model_client=model_client,
         workbench=workbench,
         reflect_on_tool_use=True,
@@ -63,7 +64,7 @@ def autogen_assistant_agent(
 
 
 @agl.rollout
-async def calc_agent(task: MathProblem, llm: agl.LLM) -> None:
+async def calc_agent(task: Dict[str, Any], llm: agl.LLM) -> None:
     """Calc-X agent rollout function.
 
     It would accept a math problem and a LLM endpoint resource.
@@ -71,8 +72,8 @@ async def calc_agent(task: MathProblem, llm: agl.LLM) -> None:
     It can also return the reward directly without `agl.emit_reward`.
     You can choose either way, but not both.
     """
-
-    calculator_mcp_server = StdioServerParams(command="uvx", args=["mcp-server-calculator"])
+    print(task)
+    calculator_mcp_server = StdioServerParams(command="python", args=["-m", "mcp_server_calculator"])
 
     async with McpWorkbench(calculator_mcp_server) as workbench:
         calc_agent = autogen_assistant_agent(
@@ -98,11 +99,12 @@ async def calc_agent(task: MathProblem, llm: agl.LLM) -> None:
             print("Timeout occurred. Error:", str(e))
             answer = "None"
         except Exception as e:
-            print("Failure:", str(e))
+            import traceback
+            traceback.print_stack()
             answer = "None"
-        reward = await evaluate(answer, str(task["result"]))
+        reward = await evaluate(answer, str(task['result']))
         agl.emit_reward(reward)  # Emit reward for tracing
-        print("answer: {} ground_truth: {} reward: {}".format(answer, task["result"], reward))
+        print("answer: {} ground_truth: {} reward: {}".format(answer, str(task['result']), reward))
 
 
 async def debug():

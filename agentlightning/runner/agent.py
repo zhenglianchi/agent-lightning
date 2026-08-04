@@ -46,7 +46,7 @@ from agentlightning.types import (
     SpanCoreFields,
 )
 from agentlightning.utils.system_snapshot import system_snapshot
-
+from agentlightning.adapter.triplet import TraceToTripletBase
 if TYPE_CHECKING:
     from agentlightning.execution.events import ExecutionEvent
 
@@ -618,6 +618,61 @@ class LitAgentRunner(Runner[T_task]):
             if event.is_set():
                 return
 
+
+    async def _post_reward_to_proxy(
+        self,
+        rollout_id: str,
+        data_id: str,
+        global_steps: int,
+        reward: float,
+        proxy_url: str,
+    ):
+        """Rollout 完成后，只发 reward 到 LLMProxy /tq/reward 端点。"""
+        import aiohttp
+        import asyncio as _asyncio
+
+        print(f"[TQ4-DEBUG] _post_reward_to_proxy: POSTing to {proxy_url}/tq/reward, rollout_id={rollout_id}, data_id={data_id}, global_steps={global_steps}, reward={reward}")
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+                    resp = await session.post(f"{proxy_url}/tq/reward", json={
+                        "rollout_id": rollout_id,
+                        "data_id": data_id,
+                        "global_steps": global_steps,
+                        "reward": reward,
+                    })
+                    print(f"[TQ4-DEBUG] _post_reward_to_proxy: response status={resp.status}, body={await resp.text()}")
+                    return
+            except Exception as e:
+                print(f"[TQ4-DEBUG] _post_reward_to_proxy: attempt {attempt+1}/{max_retries} failed: {e}")
+                if attempt < max_retries - 1:
+                    await _asyncio.sleep(2)
+        logger.error(f"Failed to POST reward to proxy after {max_retries} attempts: rollout_id={rollout_id}")
+
+    @staticmethod
+    def _extract_proxy_url(resources: NamedResources) -> Optional[str]:
+        """从 NamedResources 中提取 LLMProxy 的 base URL。
+
+        resources["main_llm"].endpoint 格式如 http://proxy:port/v1/rollout_id/attempt_id，
+        取 scheme://host:port 部分即可。
+        """
+        llm_resource = resources.get("main_llm")
+        if llm_resource is None:
+            return None
+        endpoint = getattr(llm_resource, "endpoint", None)
+        if endpoint is None:
+            return None
+        # endpoint 格式: http://host:port/v1/...，取 /v1 之前的部分
+        v1_idx = endpoint.find("/v1")
+        if v1_idx != -1:
+            result = endpoint[:v1_idx]
+            print(f"[TQ4-DEBUG] _extract_proxy_url: extracted={result} from endpoint={endpoint}")
+            return result
+        print(f"[TQ4-DEBUG] _extract_proxy_url: no /v1 found, returning full endpoint={endpoint}")
+        return endpoint
+
+
     async def _step_impl(self, next_rollout: AttemptedRollout, raise_on_exception: bool = False) -> str:
         """Execute a single rollout implementation.
 
@@ -700,6 +755,32 @@ class LitAgentRunner(Runner[T_task]):
             trace_spans = await self._post_process_rollout_result(next_rollout, result)
             last_reward = find_final_reward(trace_spans)
 
+            # ===== 新增：处理 Case 1 reward 缺失 =====
+            if last_reward is None and isinstance(result, (bool, int, float)):
+                last_reward = float(result)
+            # ===== 方案4：reward 为 None 时用 0.0 兜底，确保 uid barrier 能完成 =====
+            if last_reward is None:
+                last_reward = 0.0
+                logger.warning(f"{self._log_prefix(rollout_id)} reward is None, using 0.0 as fallback")
+            # ===== 方案4：POST reward 到 LLMProxy =====
+            global_steps = (next_rollout.metadata or {}).get("global_steps")
+            data_id = (next_rollout.metadata or {}).get("data_id")
+            proxy_url = self._extract_proxy_url(resources_update.resources)
+            print(f"[TQ4-DEBUG] _step_impl: rollout_id={rollout_id}, data_id={data_id}, global_steps={global_steps}, last_reward={last_reward}, proxy_url={proxy_url}")
+            if global_steps is not None and last_reward is not None and proxy_url is not None and data_id is not None:
+                try:
+                    await self._post_reward_to_proxy(
+                        rollout_id=rollout_id,
+                        data_id = data_id,
+                        global_steps=global_steps,
+                        reward=last_reward,
+                        proxy_url=proxy_url,
+                    )
+                except Exception as e:
+                    logger.exception(f"{self._log_prefix(rollout_id)} Failed to POST reward to proxy: {e}")
+            else:
+                logger.warning(f"{self._log_prefix(rollout_id)} SKIPPED reward POST: global_steps={global_steps}, data_id={data_id}, last_reward={last_reward}, proxy_url={proxy_url}")
+            
             end_time = time.time()
             logger.info(
                 f"{self._log_prefix(rollout_id)} Completed in "
