@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from pprint import pprint
 from typing import Dict, Tuple, Type
+import time as _time
 
 import numpy as np
 import torch
@@ -217,6 +218,7 @@ class AgentLightningTrainer(RayPPOTrainer):
         
         metrics = {}
         timing_raw = {}
+        _step_t0 = _time.time()
 
         with _timer("step", timing_raw):
 
@@ -225,11 +227,15 @@ class AgentLightningTrainer(RayPPOTrainer):
 
             # generate a batch
             with _timer("gen", timing_raw):
+                _t0 = _time.time()
                 self.checkpoint_manager.wake_up_replicas()
+                _t1 = _time.time()
                 self.agent_mode_daemon.set_up_data_and_server(
                     gen_batch.non_tensor_batch, self.llm_server_manager.get_addresses()
                 )
+                _t2 = _time.time()
                 self.agent_mode_daemon.run_until_all_finished()
+                _t3 = _time.time()
                 batch, agent_metrics = self.agent_mode_daemon.get_train_data_batch(
                     max_prompt_length=(
                         self.config.agentlightning.trace_aggregator.trajectory_max_prompt_length
@@ -244,9 +250,16 @@ class AgentLightningTrainer(RayPPOTrainer):
                     device=gen_batch.batch["fake_ids"].device,
                     global_steps=self.global_steps,
                 )
+                _t4 = _time.time()
                 metrics.update(agent_metrics)
                 self.agent_mode_daemon.clear_data_and_server()
+                _t5 = _time.time()
                 self.checkpoint_manager.sleep_replicas()
+                _t6 = _time.time()
+                _msg = f"[BENCH-BASELINE] step={self.global_steps} gen breakdown: wake_replicas={_t1-_t0:.2f}s, set_up={_t2-_t1:.2f}s, run_until_all_finished={_t3-_t2:.2f}s, get_train_data_batch={_t4-_t3:.2f}s, clear={_t5-_t4:.2f}s, sleep_replicas={_t6-_t5:.2f}s, total_gen={_t6-_t0:.2f}s"
+                print(_msg)
+                with open("/home/ma-user/install/bench_baseline.txt", "a") as _f:
+                    _f.write(_msg + "\n")
 
             if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                 with _timer("gen_max", timing_raw):
@@ -408,13 +421,14 @@ class AgentLightningTrainer(RayPPOTrainer):
             rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
             if rollout_data_dir:
                 with _timer("dump_rollout_generations", timing_raw):
-                    print(batch.batch.keys())
                     inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
                     outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
                     scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                    sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
                     self._dump_generations(
                         inputs=inputs,
                         outputs=outputs,
+                        gts=sample_gts,
                         scores=scores,
                         reward_extra_infos_dict=reward_extra_infos_dict,
                         dump_path=rollout_data_dir,
@@ -427,9 +441,18 @@ class AgentLightningTrainer(RayPPOTrainer):
         n_gpus = self.resource_pool_manager.get_n_gpus()
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
 
+        _step_t1 = _time.time()
+        _msg = f"[BENCH-BASELINE] step={self.global_steps} total_train_step={_step_t1-_step_t0:.2f}s, timing={timing_raw}"
+        print(_msg)
+        with open("/home/ma-user/install/bench_baseline.txt", "a") as _f:
+            _f.write(_msg + "\n")
+
         return metrics
 
     def fit(self):
+        if self._dump_executor._shutdown:
+            self._init_dump_executor()
+
         logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -533,6 +556,7 @@ class AgentLightningTrainer(RayPPOTrainer):
                     pprint(f"Flush the logger...")
                     del logger  # Make sure the loggers are flushed and closed properly
                     pprint(f"Training finished at step {self.global_steps}.")
+                    self._shutdown_dump_executor()
                     return
 
                 progress_bar.update(1)
