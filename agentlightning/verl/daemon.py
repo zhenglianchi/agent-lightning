@@ -506,10 +506,12 @@ class AgentModeDaemon:
 
     async def _async_set_up(self, data: Dict[str, Any], server_addresses: List[str], is_train: bool = True, global_steps=None):
         """Async helper to set up data and resources on the server."""
+        print(f"[TQ6B-ALGO] _async_set_up ENTER: is_train={is_train}, global_steps={global_steps}, num_samples={len(data.get(list(data.keys())[0], [])) if data else 0}", flush=True)
         self.clear_data_and_server()
         if server_addresses != self.backend_llm_server_addresses:
             self.backend_llm_server_addresses = server_addresses
             if self.mode == "v1" and not self.llm_proxy.is_running():
+                print(f"[TQ6B-ALGO] _async_set_up: starting proxy server v1", flush=True)
                 await self._update_proxy_server_v1()
         self.is_train = is_train
 
@@ -590,7 +592,9 @@ class AgentModeDaemon:
 
         if self.mode == "v1":
             # Enqueue all the tasks in a single batch
+            print(f"[TQ6B-ALGO] _async_set_up: enqueuing {len(enqueue_rollout_requests)} rollouts", flush=True)
             rollouts = await self.store.enqueue_many_rollouts(enqueue_rollout_requests)
+            print(f"[TQ6B-ALGO] _async_set_up: enqueued {len(rollouts)} rollouts", flush=True)
             self._task_id_to_original_sample.update(
                 {
                     # Recover the original data and store it for later use.
@@ -602,12 +606,14 @@ class AgentModeDaemon:
 
         if global_steps is not None and is_train:
             import transfer_queue as tq
+            print(f"[TQ6B-ALGO] _async_set_up: writing running barriers for {len(self._task_id_to_original_sample)} rollouts, global_steps={global_steps}", flush=True)
             for rollout_id in self._task_id_to_original_sample:
                 tq.kv_put(
                     key=rollout_id,
                     partition_id="train",
                     tag={"global_steps": global_steps, "status": "running"},
                 )
+            print(f"[TQ6B-ALGO] _async_set_up: running barriers written for {len(self._task_id_to_original_sample)} rollouts", flush=True)
 
     def set_up_data_and_server(self, data: Dict[str, Any], server_addresses: List[str], is_train: bool = True, global_steps: int = None):
         """Synchronous wrapper for setting up data and server resources."""
@@ -1135,6 +1141,7 @@ class AgentModeDaemon:
 
     def clear_data_and_server(self):
         """Resets the internal state of the daemon for the next run."""
+        print(f"[TQ6B-ALGO] clear_data_and_server: clearing state, queued={self._total_tasks_queued}", flush=True)
         self.backend_llm_server_addresses = []
         self._completed_rollouts_v0.clear()
         self._task_id_to_original_sample.clear()

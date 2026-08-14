@@ -304,9 +304,9 @@ class AgentLightningTrainer(PPOTrainer):
                 _t4 = _time.time()
                 self.checkpoint_manager.sleep_replicas()
                 _t5 = _time.time()
-                _msg = f"[BENCH-DUALWRITE] step={self.global_steps} gen breakdown: wake_replicas={_t1-_t0:.2f}s, set_up={_t2-_t1:.2f}s, replay_buffer.sample={_t3-_t2:.2f}s, clear={_t4-_t3:.2f}s, sleep_replicas={_t5-_t4:.2f}s, total_gen={_t5-_t0:.2f}s, n_triplets={len(batch.keys)}"
+                _msg = f"[BENCH-STORE-REWARD] step={self.global_steps} gen breakdown: wake_replicas={_t1-_t0:.2f}s, set_up={_t2-_t1:.2f}s, replay_buffer.sample={_t3-_t2:.2f}s, clear={_t4-_t3:.2f}s, sleep_replicas={_t5-_t4:.2f}s, total_gen={_t5-_t0:.2f}s, n_triplets={len(batch.keys)}"
                 print(_msg)
-                with open("/home/ma-user/install/bench_dualwrite.txt", "a") as _f:
+                with open("/home/ma-user/install/bench_store_reward.txt", "a") as _f:
                     _f.write(_msg + "\n")
 
             '''
@@ -453,7 +453,7 @@ class AgentLightningTrainer(PPOTrainer):
         self.agent_mode_daemon.start()
 
         from verl.trainer.main_ppo_sync import ReplayBuffer
-        self.replay_buffer = ReplayBuffer(poll_interval=1.0)
+        self.replay_buffer = ReplayBuffer(poll_interval=3.0)
 
         try:
             # 清理 TQ 残留数据（上次崩溃可能遗留 running barrier 等）
@@ -493,9 +493,9 @@ class AgentLightningTrainer(PPOTrainer):
                     _step_t0 = _time.time()
                     batch = self._train_step(batch_dict, metrics, timing_raw)
                     _step_t1 = _time.time()
-                    _msg = f"[BENCH-DUALWRITE] step={self.global_steps} total_train_step={_step_t1-_step_t0:.2f}s, timing={timing_raw}"
+                    _msg = f"[BENCH-STORE-REWARD] step={self.global_steps} total_train_step={_step_t1-_step_t0:.2f}s, timing={timing_raw}"
                     print(_msg)
-                    with open("/home/ma-user/install/bench_dualwrite.txt", "a") as _f:
+                    with open("/home/ma-user/install/bench_store_reward.txt", "a") as _f:
                         _f.write(_msg + "\n")
 
                     # save checkpoint
@@ -510,9 +510,9 @@ class AgentLightningTrainer(PPOTrainer):
                         _uw_t0 = _time.time()
                         self.checkpoint_manager.update_weights()
                         _uw_t1 = _time.time()
-                        _msg = f"[BENCH-DUALWRITE] step={self.global_steps} update_weights={_uw_t1-_uw_t0:.2f}s"
+                        _msg = f"[BENCH-STORE-REWARD] step={self.global_steps} update_weights={_uw_t1-_uw_t0:.2f}s"
                         print(_msg)
-                        with open("/home/ma-user/install/bench_dualwrite.txt", "a") as _f:
+                        with open("/home/ma-user/install/bench_store_reward.txt", "a") as _f:
                             _f.write(_msg + "\n")
 
                     # validate

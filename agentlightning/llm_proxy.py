@@ -64,6 +64,86 @@ __all__ = [
 ]
 
 
+async def _write_tq_data_zero_reward(
+    rollout_id: str,
+    triplets: List[Any],
+    max_prompt_length: Optional[int],
+    max_response_length: Optional[int],
+    data_id: str,
+    global_steps: int,
+    turn_offset: int = 0,
+) -> None:
+    """Write triplet data to TQ with reward=0 (Scheme 6b).
+
+    The Store will later update the reward when it detects a reward span.
+    """
+    import torch
+    import transfer_queue as tq
+    from verl.utils.tensordict_utils import list_of_dict_to_tensordict
+
+    print(f"[TQ6B-PROXY] _write_tq_data_zero_reward: rollout_id={rollout_id}, triplets={len(triplets)}, data_id={data_id}, global_steps={global_steps}, turn_offset={turn_offset}", flush=True)
+    try:
+        keys, tags, fields_list = [], [], []
+        for i, triplet in enumerate(triplets):
+            turn_index = turn_offset + i
+            prompt_ids = triplet.prompt.get("token_ids", [])
+            response_ids = triplet.response.get("token_ids", [])
+            if not prompt_ids or not response_ids:
+                continue
+
+            is_drop = max_prompt_length is not None and len(prompt_ids) > max_prompt_length
+            if max_prompt_length:
+                prompt_ids = prompt_ids[:max_prompt_length]
+            if max_response_length:
+                response_ids = response_ids[:max_response_length]
+
+            seq_ids = prompt_ids + response_ids
+            prompt_len = len(prompt_ids)
+            response_len = len(response_ids)
+            seq_len = prompt_len + response_len
+
+            token_level_scores = [0.0] * response_len
+            token_level_scores_tensor = torch.tensor(token_level_scores, dtype=torch.float32)
+
+            field = {
+                "prompts": torch.tensor(prompt_ids, dtype=torch.long),
+                "responses": torch.tensor(response_ids, dtype=torch.long),
+                "input_ids": torch.tensor(seq_ids, dtype=torch.long),
+                "attention_mask": torch.ones(seq_len, dtype=torch.long),
+                "position_ids": torch.arange(seq_len, dtype=torch.long),
+                "token_level_scores": token_level_scores_tensor,
+                "rm_scores": token_level_scores_tensor,
+                "response_mask": torch.ones(response_len, dtype=torch.long),
+                "loss_mask": torch.ones(response_len, dtype=torch.long),
+                "uid": data_id,
+                "num_turns": 1,
+            }
+
+            key = f"{data_id}_{rollout_id}_{turn_index}"
+            keys.append(key)
+            tags.append({
+                "global_steps": global_steps,
+                "status": "success",
+                "seq_len": seq_len,
+                "is_drop": is_drop,
+            })
+            fields_list.append(field)
+
+        if fields_list:
+            fields = list_of_dict_to_tensordict(fields_list)
+            await tq.async_kv_batch_put(
+                keys=keys,
+                partition_id="train",
+                fields=fields,
+                tags=tags,
+            )
+            print(f"[TQ6B-PROXY] wrote {len(fields_list)} TQ data keys for rollout_id={rollout_id}, keys={keys}", flush=True)
+        else:
+            print(f"[TQ6B-PROXY] no valid fields to write for rollout_id={rollout_id}", flush=True)
+    except Exception as e:
+        logger.exception(f"[TQ6B-PROXY] Failed to write TQ data for rollout {rollout_id}: {e}")
+
+
 class ModelConfig(TypedDict):
     """LiteLLM model registration entry.
 
@@ -438,7 +518,7 @@ class LightningSpanExporter(SpanExporter):
                     fut = asyncio.run_coroutine_threadsafe(add_otel_span_task, loop)
                     fut.result()  # Bubble up any exceptions from the coroutine.
 
-            # ===== 方案4：累积 spans（不调 adapter），等待 /tq/reward 时一次性 adapt =====
+            # ===== 方案6b：直接 adapt 子树 spans，写入 TQ (reward=0) =====
             proxy = get_active_llm_proxy()
             if getattr(proxy, "_adapter", None) is not None and rollout_id:
                 try:
@@ -448,11 +528,39 @@ class LightningSpanExporter(SpanExporter):
                         if isinstance(span, ReadableSpan) else span
                         for span in subtree_spans
                     ]
-                    with proxy._pending_spans_lock:
-                        proxy._pending_spans.setdefault(rollout_id, []).extend(source_normalized)
-                    print(f"[TQ4-DEBUG] _maybe_flush: accumulated {len(source_normalized)} spans for rollout_id={rollout_id}, total pending={len(proxy._pending_spans[rollout_id])}")
+                    triplets = proxy._adapter.adapt(source_normalized)
+                    print(f"[TQ6B-PROXY] _maybe_flush: adapted {len(source_normalized)} spans → {len(triplets)} triplets for rollout_id={rollout_id}", flush=True)
+
+                    if triplets:
+                        turn_offset = proxy._rollout_turn_counter.get(rollout_id, 0)
+                        data_id = str(headers_merged.get("x-data-id", ""))
+                        global_steps = int(headers_merged.get("x-global-steps", "0") or "0")
+
+                        # Epoch cleanup: when global_steps changes, old rollout_ids
+                        # will never appear again — purge to prevent memory growth.
+                        prev_gs = proxy._current_global_steps
+                        if prev_gs is not None and global_steps != prev_gs:
+                            proxy._rollout_turn_counter.clear()
+                            turn_offset = 0
+                        proxy._current_global_steps = global_steps
+
+                        loop = self._ensure_loop()
+                        fut = asyncio.run_coroutine_threadsafe(
+                            _write_tq_data_zero_reward(
+                                rollout_id,
+                                triplets,
+                                proxy._max_prompt_length,
+                                proxy._max_response_length,
+                                data_id,
+                                global_steps,
+                                turn_offset=turn_offset,
+                            ),
+                            loop,
+                        )
+                        proxy._rollout_turn_counter[rollout_id] = turn_offset + len(triplets)
+                        fut.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
                 except Exception as e:
-                    logger.warning(f"Failed to accumulate spans for rollout {rollout_id}: {e}")
+                    logger.warning(f"[TQ6B-PROXY] Failed to write TQ data for rollout {rollout_id}: {e}")
 
     def _get_root_span_ids(self) -> Iterable[int]:
         """Yield span_ids for root spans currently in the buffer.
@@ -581,11 +689,26 @@ class RolloutAttemptMiddleware(BaseHTTPMiddleware):
                 # Allocate a monotonic sequence id per (rollout, attempt).
                 sequence_id = await store.get_next_span_sequence_id(rollout_id, attempt_id)
 
-                request.scope["headers"] = list(request.scope["headers"]) + [
+                extra_headers = [
                     (b"x-rollout-id", rollout_id.encode()),
                     (b"x-attempt-id", attempt_id.encode()),
                     (b"x-sequence-id", str(sequence_id).encode()),
                 ]
+
+                # Inject data_id and global_steps from rollout metadata for TQ writes.
+                try:
+                    rollout = await store.get_rollout_by_id(rollout_id)
+                    if rollout is not None and rollout.metadata:
+                        data_id = str(rollout.metadata.get("data_id", ""))
+                        global_steps = str(rollout.metadata.get("global_steps", ""))
+                        if data_id:
+                            extra_headers.append((b"x-data-id", data_id.encode()))
+                        if global_steps:
+                            extra_headers.append((b"x-global-steps", global_steps.encode()))
+                except Exception:
+                    logger.warning(f"Failed to fetch rollout metadata for header injection: rollout_id={rollout_id}")
+
+                request.scope["headers"] = list(request.scope["headers"]) + extra_headers
             else:
                 logger.warning("Store is not set. Skipping sequence id allocation and header injection.")
 
@@ -1096,19 +1219,15 @@ class LLMProxy:
     ):
         self.store = store
         self._adapter: Optional[Any] = adapter
-        self._pending_spans: Dict[str, List[Any]] = {}
-        self._pending_spans_lock = threading.Lock()
         self._max_prompt_length: Optional[int] = max_prompt_length
         self._max_response_length: Optional[int] = max_response_length
+        self._rollout_turn_counter: Dict[str, int] = {}
+        self._current_global_steps: Optional[int] = None
 
-        # 方案4：初始化 TQ
+        # 方案6b：初始化 TQ
         import transfer_queue as tq
         tq.init()
-        print(f"[TQ4-DEBUG] LLMProxy.__init__: adapter={adapter is not None}, max_prompt_length={max_prompt_length}, max_response_length={max_response_length}, tq.init() done")
-
-        # 方案4：注册 /tq/reward 端点
-        self._register_tq_reward_endpoint()
-        print(f"[TQ4-DEBUG] LLMProxy.__init__: _register_tq_reward_endpoint() done")
+        print(f"[TQ6B-PROXY] LLMProxy.__init__: adapter={adapter is not None}, max_prompt_length={max_prompt_length}, max_response_length={max_response_length}, tq.init() done", flush=True)
 
         if launcher_args is not None and (
             port is not None or host is not None or launch_mode != "mp" or num_workers != 1
@@ -1233,125 +1352,6 @@ class LLMProxy:
             # If it's not the first time to initialize the callbacks, also
             # reset LiteLLM's logging worker so its asyncio.Queue binds to the new loop.
             _reset_litellm_logging_worker()
-
-    def _register_tq_reward_endpoint(self):
-        """注册 /tq/reward FastAPI 路由，接收 reward 并写 TQ。"""
-        from fastapi import Request
-        from verl.utils.tensordict_utils import list_of_dict_to_tensordict
-        import torch
-        import transfer_queue as tq
-
-        proxy_self = self
-
-        @app.post("/tq/reward")
-        async def tq_reward(request: Request):
-            body = await request.json()
-            rollout_id = body["rollout_id"]
-            global_steps = body["global_steps"]
-            reward = body["reward"]
-            data_id = body["data_id"]
-            max_prompt_length = proxy_self._max_prompt_length
-            max_response_length = proxy_self._max_response_length
-            print(f"[TQ4-DEBUG] /tq/reward received: rollout_id={rollout_id}, data_id={data_id}, global_steps={global_steps}, reward={reward}")
-
-            # 1. 取累积的 spans，一次性调用 adapter（与 enableTQ 分支行为一致）
-            with proxy_self._pending_spans_lock:
-                spans = proxy_self._pending_spans.pop(rollout_id, [])
-            print(f"[TQ4-DEBUG] /tq/reward: popped {len(spans)} spans for rollout_id={rollout_id}")
-            if not spans:
-                logger.warning(f"/tq/reward: No cached spans for rollout {rollout_id}, writing finished barrier only.")
-                tq.kv_put(
-                    key=rollout_id,
-                    partition_id="train",
-                    tag={"global_steps": global_steps, "status": "finished"},
-                )
-                return {"status": "ok", "warning": "no_cached_spans"}
-
-            # 2. 一次性 adapt 所有 spans → triplets
-            triplets = proxy_self._adapter.adapt(spans)
-            print(f"[TQ4-DEBUG] /tq/reward: adapter produced {len(triplets)} triplets")
-            if not triplets:
-                logger.warning(f"/tq/reward: Adapter returned empty triplets for rollout {rollout_id}, writing finished barrier only.")
-                tq.kv_put(
-                    key=rollout_id,
-                    partition_id="train",
-                    tag={"global_steps": global_steps, "status": "finished"},
-                )
-                return {"status": "ok", "warning": "empty_triplets"}
-
-            # 3. 构建 fields（transition 模式：每个 triplet 独立一条数据）
-            keys, tags, fields_list = [], [], []
-            for turn_index, triplet in enumerate(triplets):
-                prompt_ids = triplet.prompt.get("token_ids", [])
-                response_ids = triplet.response.get("token_ids", [])
-                if not prompt_ids or not response_ids:
-                    continue
-
-                is_drop = max_prompt_length is not None and len(prompt_ids) > max_prompt_length
-
-                if max_prompt_length:
-                    prompt_ids = prompt_ids[:max_prompt_length]
-                if max_response_length:
-                    response_ids = response_ids[:max_response_length]
-
-                seq_ids = prompt_ids + response_ids
-                prompt_len = len(prompt_ids)
-                response_len = len(response_ids)
-                seq_len = prompt_len + response_len
-
-                # reward 放在 response 最后一个 token
-                token_level_scores = [0.0] * response_len
-                token_level_scores[-1] = reward
-                token_level_scores_tensor = torch.tensor(token_level_scores, dtype=torch.float32)
-
-                field = {
-                    "prompts": torch.tensor(prompt_ids, dtype=torch.long),
-                    "responses": torch.tensor(response_ids, dtype=torch.long),
-                    "input_ids": torch.tensor(seq_ids, dtype=torch.long),
-                    "attention_mask": torch.ones(seq_len, dtype=torch.long),
-                    "position_ids": torch.arange(seq_len, dtype=torch.long),
-                    "token_level_scores": token_level_scores_tensor,
-                    "rm_scores": token_level_scores_tensor,
-                    "response_mask": torch.ones(response_len, dtype=torch.long),
-                    "loss_mask": torch.ones(response_len, dtype=torch.long),
-                    "uid": data_id,
-                    "num_turns": 1,
-                }
-
-                key = f"{data_id}_{rollout_id}_{turn_index}"
-                keys.append(key)
-                tags.append({
-                    "global_steps": global_steps,
-                    "status": "success",
-                    "seq_len": seq_len,
-                    "is_drop": is_drop,
-                })
-                fields_list.append(field)
-
-            # 4. 写 TQ 数据 keys（用 async 版本避免阻塞事件循环）
-            if fields_list:
-                print(f"[TQ4-DEBUG] /tq/reward: building tensordict from {len(fields_list)} fields")
-                fields = list_of_dict_to_tensordict(fields_list)
-                print(f"[TQ4-DEBUG] /tq/reward: calling tq.async_kv_batch_put, keys={keys}")
-                await tq.async_kv_batch_put(
-                    keys=keys,
-                    partition_id="train",
-                    fields=fields,
-                    tags=tags,
-                )
-                print(f"[TQ4-DEBUG] /tq/reward: wrote {len(fields_list)} data keys to TQ, keys={keys}")
-
-            # 5. 写 uid barrier（通知 ReplayBuffer 该 rollout 已完成）
-            print(f"[TQ4-DEBUG] /tq/reward: calling tq.async_kv_put finished barrier for rollout_id={rollout_id}")
-            await tq.async_kv_put(
-                key=rollout_id,
-                partition_id="train",
-                tag={"global_steps": global_steps, "status": "finished"},
-            )
-            print(f"[TQ4-DEBUG] /tq/reward: wrote finished barrier for rollout_id={rollout_id}")
-
-            return {"status": "ok", "triplets_written": len(fields_list)}
-    
 
     @asynccontextmanager
     async def _serve_context(self) -> AsyncGenerator[None, None]:

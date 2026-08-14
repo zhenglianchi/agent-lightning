@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 from typing import Iterable, List
 
 from agentlightning import setup_logging
@@ -119,6 +120,26 @@ def main(argv: Iterable[str] | None = None) -> int:
         tracker=tracker,
         n_workers=args.n_workers,
     )
+    # Pre-initialize Ray and TransferQueue to avoid blocking the event loop during request handling.
+    # When RAY_ADDRESS is set, ray.init() + tq.init() are called here (before the server starts),
+    # so that collection_based.py's `if not ray.is_initialized()` guard skips the blocking init.
+    ray_address = os.environ.get("RAY_ADDRESS")
+    if ray_address:
+        import ray
+
+        ray_namespace = os.environ.get("RAY_NAMESPACE", "transfer_queue")
+        if not ray.is_initialized():
+            logger.info(f"Pre-initializing Ray: address={ray_address}, namespace={ray_namespace}")
+            ray.init(address=ray_address, namespace=ray_namespace)
+            logger.info(f"Ray initialized: namespace={ray.get_runtime_context().namespace}")
+        try:
+            import transfer_queue as tq
+
+            tq.init()
+            logger.info("TransferQueue pre-initialized successfully")
+        except Exception as e:
+            logger.warning(f"TransferQueue pre-initialization failed (will retry on first request): {e}")
+
     try:
         asyncio.run(server.run_forever())
     except RuntimeError as exc:

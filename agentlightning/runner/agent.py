@@ -619,60 +619,6 @@ class LitAgentRunner(Runner[T_task]):
                 return
 
 
-    async def _post_reward_to_proxy(
-        self,
-        rollout_id: str,
-        data_id: str,
-        global_steps: int,
-        reward: float,
-        proxy_url: str,
-    ):
-        """Rollout 完成后，只发 reward 到 LLMProxy /tq/reward 端点。"""
-        import aiohttp
-        import asyncio as _asyncio
-
-        print(f"[TQ4-DEBUG] _post_reward_to_proxy: POSTing to {proxy_url}/tq/reward, rollout_id={rollout_id}, data_id={data_id}, global_steps={global_steps}, reward={reward}")
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-                    resp = await session.post(f"{proxy_url}/tq/reward", json={
-                        "rollout_id": rollout_id,
-                        "data_id": data_id,
-                        "global_steps": global_steps,
-                        "reward": reward,
-                    })
-                    print(f"[TQ4-DEBUG] _post_reward_to_proxy: response status={resp.status}, body={await resp.text()}")
-                    return
-            except Exception as e:
-                print(f"[TQ4-DEBUG] _post_reward_to_proxy: attempt {attempt+1}/{max_retries} failed: {e}")
-                if attempt < max_retries - 1:
-                    await _asyncio.sleep(2)
-        logger.error(f"Failed to POST reward to proxy after {max_retries} attempts: rollout_id={rollout_id}")
-
-    @staticmethod
-    def _extract_proxy_url(resources: NamedResources) -> Optional[str]:
-        """从 NamedResources 中提取 LLMProxy 的 base URL。
-
-        resources["main_llm"].endpoint 格式如 http://proxy:port/v1/rollout_id/attempt_id，
-        取 scheme://host:port 部分即可。
-        """
-        llm_resource = resources.get("main_llm")
-        if llm_resource is None:
-            return None
-        endpoint = getattr(llm_resource, "endpoint", None)
-        if endpoint is None:
-            return None
-        # endpoint 格式: http://host:port/v1/...，取 /v1 之前的部分
-        v1_idx = endpoint.find("/v1")
-        if v1_idx != -1:
-            result = endpoint[:v1_idx]
-            print(f"[TQ4-DEBUG] _extract_proxy_url: extracted={result} from endpoint={endpoint}")
-            return result
-        print(f"[TQ4-DEBUG] _extract_proxy_url: no /v1 found, returning full endpoint={endpoint}")
-        return endpoint
-
-
     async def _step_impl(self, next_rollout: AttemptedRollout, raise_on_exception: bool = False) -> str:
         """Execute a single rollout implementation.
 
@@ -690,6 +636,7 @@ class LitAgentRunner(Runner[T_task]):
         agent = self.get_agent()
 
         rollout_id = next_rollout.rollout_id
+        print(f"[TQ6B-AGENT] _step_impl ENTER: rollout_id={rollout_id}", flush=True)
 
         resources_id = next_rollout.resources_id
         resources_update = None
@@ -705,10 +652,11 @@ class LitAgentRunner(Runner[T_task]):
                 logger.error(f"{self._log_prefix(rollout_id)} Failed to fetch resources. Skipping.")
                 return rollout_id
 
-        logger.debug(f"{self._log_prefix(rollout_id)} Resources fetched (id={resources_update.resources_id}).")
+        print(f"[TQ6B-AGENT] _step_impl: resources fetched for rollout_id={rollout_id}", flush=True)
 
         trace_spans: List[ReadableSpan] | List[Span] = []
         has_exception: bool = False
+        last_reward: float = 0.0
 
         try:
             await self._trigger_hooks(hook_type="on_rollout_start", agent=agent, runner=self, rollout=next_rollout)
@@ -730,20 +678,20 @@ class LitAgentRunner(Runner[T_task]):
                     rollout_method = (
                         agent.training_rollout_async if next_rollout.mode == "train" else agent.validation_rollout_async
                     )
-                    logger.debug(f"{self._log_prefix(rollout_id)} Starting async rollout method.")
+                    print(f"[TQ6B-AGENT] _step_impl: starting async rollout_method for rollout_id={rollout_id}", flush=True)
                     result = await rollout_method(
                         next_rollout.input, resources=resources_update.resources, rollout=next_rollout
                     )
-                    logger.debug(f"{self._log_prefix(rollout_id)} Async rollout method completed.")
+                    print(f"[TQ6B-AGENT] _step_impl: async rollout_method DONE for rollout_id={rollout_id}, result_type={type(result).__name__}", flush=True)
                 else:
                     rollout_method = (
                         agent.training_rollout if next_rollout.mode == "train" else agent.validation_rollout
                     )
-                    logger.debug(f"{self._log_prefix(rollout_id)} Starting sync rollout method.")
+                    print(f"[TQ6B-AGENT] _step_impl: starting sync rollout_method for rollout_id={rollout_id}", flush=True)
                     result = rollout_method(
                         next_rollout.input, resources=resources_update.resources, rollout=next_rollout
                     )
-                    logger.debug(f"{self._log_prefix(rollout_id)} Sync rollout method completed.")
+                    print(f"[TQ6B-AGENT] _step_impl: sync rollout_method DONE for rollout_id={rollout_id}, result_type={type(result).__name__}", flush=True)
 
                 await self._trigger_hooks(
                     hook_type="on_trace_end", agent=agent, runner=self, tracer=self._tracer, rollout=next_rollout
@@ -752,35 +700,18 @@ class LitAgentRunner(Runner[T_task]):
             logger.debug(f"{self._log_prefix(rollout_id)} Trace context exited.")
 
             # Possible exceptions in post_process will be caught in the overall exception handler
+            print(f"[TQ6B-AGENT] _step_impl: calling _post_process_rollout_result for rollout_id={rollout_id}", flush=True)
             trace_spans = await self._post_process_rollout_result(next_rollout, result)
+            print(f"[TQ6B-AGENT] _step_impl: _post_process_rollout_result DONE for rollout_id={rollout_id}, spans={len(trace_spans)}", flush=True)
             last_reward = find_final_reward(trace_spans)
 
-            # ===== 新增：处理 Case 1 reward 缺失 =====
+            # ===== 处理 reward 缺失 =====
             if last_reward is None and isinstance(result, (bool, int, float)):
                 last_reward = float(result)
-            # ===== 方案4：reward 为 None 时用 0.0 兜底，确保 uid barrier 能完成 =====
             if last_reward is None:
                 last_reward = 0.0
                 logger.warning(f"{self._log_prefix(rollout_id)} reward is None, using 0.0 as fallback")
-            # ===== 方案4：POST reward 到 LLMProxy =====
-            global_steps = (next_rollout.metadata or {}).get("global_steps")
-            data_id = (next_rollout.metadata or {}).get("data_id")
-            proxy_url = self._extract_proxy_url(resources_update.resources)
-            print(f"[TQ4-DEBUG] _step_impl: rollout_id={rollout_id}, data_id={data_id}, global_steps={global_steps}, last_reward={last_reward}, proxy_url={proxy_url}")
-            if global_steps is not None and last_reward is not None and proxy_url is not None and data_id is not None:
-                try:
-                    await self._post_reward_to_proxy(
-                        rollout_id=rollout_id,
-                        data_id = data_id,
-                        global_steps=global_steps,
-                        reward=last_reward,
-                        proxy_url=proxy_url,
-                    )
-                except Exception as e:
-                    logger.exception(f"{self._log_prefix(rollout_id)} Failed to POST reward to proxy: {e}")
-            else:
-                logger.warning(f"{self._log_prefix(rollout_id)} SKIPPED reward POST: global_steps={global_steps}, data_id={data_id}, last_reward={last_reward}, proxy_url={proxy_url}")
-            
+
             end_time = time.time()
             logger.info(
                 f"{self._log_prefix(rollout_id)} Completed in "
@@ -803,16 +734,24 @@ class LitAgentRunner(Runner[T_task]):
                 logger.exception(f"{self._log_prefix(rollout_id)} Exception during on_rollout_end hook.")
 
             try:
+                print(f"[TQ6B-AGENT] _step_impl finally: calling update_attempt for rollout_id={rollout_id}, has_exception={has_exception}, last_reward={last_reward}", flush=True)
                 if has_exception:
-                    # possibly timed out and cancelled?
-                    await store.update_attempt(rollout_id, next_rollout.attempt.attempt_id, status="failed")
+                    await store.update_attempt(
+                        rollout_id, next_rollout.attempt.attempt_id,
+                        status="failed",
+                    )
                 else:
-                    await store.update_attempt(rollout_id, next_rollout.attempt.attempt_id, status="succeeded")
+                    await store.update_attempt(
+                        rollout_id, next_rollout.attempt.attempt_id,
+                        status="succeeded",
+                    )
+                print(f"[TQ6B-AGENT] _step_impl finally: update_attempt done for rollout_id={rollout_id}", flush=True)
             except Exception:
                 logger.exception(
                     f"{self._log_prefix(rollout_id)} Exception during update_attempt. Giving up the update."
                 )
 
+        print(f"[TQ6B-AGENT] _step_impl EXIT: rollout_id={rollout_id}", flush=True)
         return rollout_id
 
     async def iter(self, *, event: Optional[ExecutionEvent] = None) -> None:
@@ -844,22 +783,21 @@ class LitAgentRunner(Runner[T_task]):
                 # Retrieve the next rollout
                 next_rollout: Optional[Rollout] = None
                 while not (event is not None and event.is_set()):
-                    logger.debug(f"{self._log_prefix()} Try to poll for next rollout.")
                     next_rollout = await store.dequeue_rollout(worker_id=self.get_worker_id())
-                    logger.debug(f"{self._log_prefix()} Next rollout retrieved: {next_rollout}")
-                    if next_rollout is None:
-                        logger.debug(
-                            f"{self._log_prefix()} No rollout to poll. Waiting for {self._poll_interval} seconds."
-                        )
-                        await self._sleep_until_next_poll(event)
-                    else:
+                    if next_rollout is not None:
+                        print(f"[TQ6B-AGENT] iter: dequeued rollout_id={next_rollout.rollout_id}, worker_id={self.get_worker_id()}", flush=True)
                         break
+                    else:
+                        await self._sleep_until_next_poll(event)
 
                 if next_rollout is None:
+                    print(f"[TQ6B-AGENT] iter: next_rollout is None, exiting loop", flush=True)
                     return
 
                 # Execute the step
+                print(f"[TQ6B-AGENT] iter: calling _step_impl for rollout_id={next_rollout.rollout_id}", flush=True)
                 await self._step_impl(next_rollout)
+                print(f"[TQ6B-AGENT] iter: _step_impl done for rollout_id={next_rollout.rollout_id}, processed={num_tasks_processed+1}", flush=True)
 
                 num_tasks_processed += 1
                 if num_tasks_processed % 10 == 0 or num_tasks_processed == 1:

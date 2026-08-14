@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any, Type
 
 import hydra
@@ -59,16 +60,29 @@ def run_ppo(
     trainer_cls: Type[AgentLightningTrainer],
     daemon_cls: Type[AgentModeDaemon],
 ) -> None:
-    if not ray.is_initialized():
-        # this is for local ray cluster
+    # Always re-init to ensure correct namespace for TQ sharing
+    if ray.is_initialized():
+        ray.shutdown()
+    try:
+        # verl >= 0.6.0
         num_cpus = config.ray_kwargs.ray_init.num_cpus
+    except AttributeError:
+        # verl < 0.6.0
+        num_cpus = config.ray_init.num_cpus
 
-        ray.init(
-            runtime_env={
-                "env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN"}
-            },
-            num_cpus=num_cpus,
-        )
+    ray.init(
+        address=os.environ.get("RAY_ADDRESS", "auto"),
+        namespace=os.environ.get("RAY_NAMESPACE", "transfer_queue"),
+        runtime_env={
+            "env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN"}
+        },
+        num_cpus=num_cpus,
+    )
+    print(
+        f"[TQ6B-DEBUG] entrypoint.py ray.init: namespace={ray.get_runtime_context().namespace}, "
+        f"address={os.environ.get('RAY_ADDRESS', 'auto')}",
+        flush=True,
+    )
 
     runner = TaskRunner.remote()
     ray.get(
