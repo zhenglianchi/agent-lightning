@@ -27,6 +27,7 @@ from agentlightning.adapter.triplet import TracerTraceToTriplet, TraceToTripletB
 from agentlightning.llm_proxy import LLMProxy, ModelConfig
 from agentlightning.store.base import LightningStore
 from agentlightning.types import EnqueueRolloutRequest, Rollout, RolloutConfig, Task
+from agentlightning.bench_detail import bench_log, now, rss_mb
 
 __all__ = [
     "AgentModeDaemon",
@@ -1095,7 +1096,18 @@ class AgentModeDaemon:
             response_len = len(raw_response_ids_list[i])
             tags.append({"seq_len": prompt_len + response_len, "is_drop": is_drop_list[i]})
 
+        _t_tq_write = now()
         tq.kv_batch_put(keys=keys, partition_id=partition_id, fields=fields, tags=tags)
+        _t_tq_write_end = now()
+        _seq_lens = [t.get("seq_len", 0) for t in tags]
+        bench_log("store_reward", global_steps, "daemon_tq_write",
+            daemon_tq_write=round(_t_tq_write_end - _t_tq_write, 4),
+            n_triplets=n_transition,
+            unpadded_bytes=sum(sl * 8 for sl in _seq_lens),
+            avg_seq_len=round(float(np.mean(_seq_lens)), 1) if _seq_lens else 0,
+            max_seq_len=max(_seq_lens) if _seq_lens else 0,
+            min_seq_len=min(_seq_lens) if _seq_lens else 0,
+            rss_mb=rss_mb())
 
         batch_meta = KVBatchMeta(
             keys=keys,
