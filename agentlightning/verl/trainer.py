@@ -41,6 +41,7 @@ from verl.utils.tracking import Tracking
 from agentlightning.adapter import TraceAdapter, TraceToTripletBase
 from agentlightning.llm_proxy import LLMProxy
 from agentlightning.store.base import LightningStore
+from agentlightning.bench_detail import bench_log, now, rss_mb
 
 from .daemon import AgentModeDaemon
 
@@ -308,6 +309,10 @@ class AgentLightningTrainer(PPOTrainer):
                 print(_msg)
                 with open("/home/ma-user/install/bench_store_reward.txt", "a") as _f:
                     _f.write(_msg + "\n")
+                bench_log("store_reward", self.global_steps, "gen",
+                    gen_wake=_t1-_t0, gen_setup=_t2-_t1, gen_replay_sample=_t3-_t2,
+                    gen_clear=_t4-_t3, gen_sleep=_t5-_t4, gen_total=_t5-_t0,
+                    n_triplets=len(batch.keys), rss_mb=rss_mb())
 
             '''
             TODO: 后续实现
@@ -497,6 +502,8 @@ class AgentLightningTrainer(PPOTrainer):
                     print(_msg)
                     with open("/home/ma-user/install/bench_store_reward.txt", "a") as _f:
                         _f.write(_msg + "\n")
+                    bench_log("store_reward", self.global_steps, "step",
+                        total_train_step=_step_t1-_step_t0, timing=timing_raw, rss_mb=rss_mb())
 
                     # save checkpoint
                     if self.config.trainer.save_freq > 0 and (
@@ -514,6 +521,8 @@ class AgentLightningTrainer(PPOTrainer):
                         print(_msg)
                         with open("/home/ma-user/install/bench_store_reward.txt", "a") as _f:
                             _f.write(_msg + "\n")
+                        bench_log("store_reward", self.global_steps, "update_weights",
+                            uw_total=_uw_t1-_uw_t0, rss_mb=rss_mb())
 
                     # validate
                     if self.config.trainer.test_freq > 0 and (

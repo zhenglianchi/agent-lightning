@@ -49,6 +49,7 @@ from starlette.types import Scope
 
 from agentlightning.semconv import LightningResourceAttributes
 from agentlightning.types import LLM, ProxyLLM
+from agentlightning.bench_detail import bench_log, now, rss_mb
 from agentlightning.utils.server_launcher import (
     LaunchMode,
     PythonServerLauncher,
@@ -83,7 +84,9 @@ async def _write_tq_data_zero_reward(
 
     print(f"[TQ6B-PROXY] _write_tq_data_zero_reward: rollout_id={rollout_id}, triplets={len(triplets)}, data_id={data_id}, global_steps={global_steps}, turn_offset={turn_offset}", flush=True)
     try:
+        _t0 = now()
         keys, tags, fields_list = [], [], []
+        _seq_lens = []
         for i, triplet in enumerate(triplets):
             turn_index = turn_offset + i
             prompt_ids = triplet.prompt.get("token_ids", [])
@@ -101,6 +104,7 @@ async def _write_tq_data_zero_reward(
             prompt_len = len(prompt_ids)
             response_len = len(response_ids)
             seq_len = prompt_len + response_len
+            _seq_lens.append(seq_len)
 
             token_level_scores = [0.0] * response_len
             token_level_scores_tensor = torch.tensor(token_level_scores, dtype=torch.float32)
@@ -129,16 +133,38 @@ async def _write_tq_data_zero_reward(
             })
             fields_list.append(field)
 
+        _t_adapt_end = now()
         if fields_list:
+            _t_build_start = now()
             fields = list_of_dict_to_tensordict(fields_list)
+            _t_build_end = now()
+            _t_write_start = now()
             await tq.async_kv_batch_put(
                 keys=keys,
                 partition_id="train",
                 fields=fields,
                 tags=tags,
             )
+            _t_write_end = now()
+            _unpadded_bytes = sum(s * 8 for s in _seq_lens)
+            bench_log("store_reward", global_steps, "proxy_write_tq",
+                proxy_adapt=_t_adapt_end - _t0,
+                proxy_build=_t_build_end - _t_build_start,
+                proxy_tq_write=_t_write_end - _t_write_start,
+                proxy_total=_t_write_end - _t0,
+                n_triplets=len(fields_list),
+                unpadded_bytes=_unpadded_bytes,
+                avg_seq_len=sum(_seq_lens) / len(_seq_lens) if _seq_lens else 0,
+                max_seq_len=max(_seq_lens) if _seq_lens else 0,
+                min_seq_len=min(_seq_lens) if _seq_lens else 0,
+                rss_mb=rss_mb())
             print(f"[TQ6B-PROXY] wrote {len(fields_list)} TQ data keys for rollout_id={rollout_id}, keys={keys}", flush=True)
         else:
+            bench_log("store_reward", global_steps, "proxy_write_tq",
+                proxy_adapt=_t_adapt_end - _t0,
+                proxy_total=now() - _t0,
+                n_triplets=0,
+                rss_mb=rss_mb())
             print(f"[TQ6B-PROXY] no valid fields to write for rollout_id={rollout_id}", flush=True)
     except Exception as e:
         logger.exception(f"[TQ6B-PROXY] Failed to write TQ data for rollout {rollout_id}: {e}")

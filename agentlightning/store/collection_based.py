@@ -59,6 +59,7 @@ from agentlightning.types import (
     Worker,
     WorkerStatus,
 )
+from agentlightning.bench_detail import bench_log, now, rss_mb
 from agentlightning.utils.id import generate_id
 from agentlightning.utils.metrics import MetricsBackend
 
@@ -1217,17 +1218,23 @@ class CollectionBasedLightningStore(LightningStore, Generic[T_collections]):
             }
             return TensorDict(final_data, batch_size=[batch_size])
 
+        _t0 = now()
+        _t_init_start = now()
         await asyncio.to_thread(_ensure_tq_initialized)
+        _t_init_end = now()
 
         print(f"[TQ6B-STORE] _update_tq_reward_async start: rollout_id={rollout_id}, reward={reward}, data_id={data_id}, global_steps={global_steps}", flush=True)
 
         prefix = f"{data_id}_{rollout_id}_"
         print(f"[TQ6B-STORE] calling tq.async_kv_list, prefix={prefix}", flush=True)
+        _t_list_start = now()
         all_items = await tq.async_kv_list(partition_id="train")
+        _t_list_end = now()
         all_keys = list(all_items.get("train", {}).keys())
         keys_to_update = [k for k in all_keys if k.startswith(prefix)]
         print(f"[TQ6B-STORE] kv_list returned {len(all_keys)} total keys, {len(keys_to_update)} matched prefix, keys={keys_to_update}", flush=True)
 
+        _t_wait_start = now()
         if not keys_to_update:
             max_wait_retries = 5
             for wait_attempt in range(max_wait_retries):
@@ -1240,17 +1247,28 @@ class CollectionBasedLightningStore(LightningStore, Generic[T_collections]):
                     print(f"[TQ6B-STORE] found {len(keys_to_update)} TQ keys after waiting {wait_attempt+1}s: {keys_to_update}", flush=True)
                     break
             if not keys_to_update:
+                _t_wait_end = now()
                 logger.warning(f"[TQ6B-STORE] No TQ keys found for rollout {rollout_id} after {max_wait_retries}s, writing barrier only.")
                 barrier_tag = {"global_steps": global_steps, "status": "finished"}
                 max_retries = 3
                 for attempt in range(max_retries):
                     try:
                         print(f"[TQ6B-STORE] writing finished barrier (no data keys, attempt {attempt+1}/{max_retries}): rollout_id={rollout_id}", flush=True)
+                        _t_barrier_start = now()
                         await tq.async_kv_put(
                             key=rollout_id,
                             partition_id="train",
                             tag=barrier_tag,
                         )
+                        _t_barrier_end = now()
+                        bench_log("store_reward", global_steps, "store_update_reward",
+                            store_tq_init=_t_init_end - _t_init_start,
+                            store_tq_list=_t_list_end - _t_list_start,
+                            store_tq_wait=_t_wait_end - _t_wait_start,
+                            store_barrier_write=_t_barrier_end - _t_barrier_start,
+                            store_total=_t_barrier_end - _t0,
+                            n_keys=0,
+                            rss_mb=rss_mb())
                         print(f"[TQ6B-STORE] finished barrier written (no data keys): rollout_id={rollout_id}", flush=True)
                         return
                     except Exception as barrier_e:
@@ -1260,19 +1278,27 @@ class CollectionBasedLightningStore(LightningStore, Generic[T_collections]):
                         else:
                             logger.error(f"[TQ6B-STORE] FAILED rollout {rollout_id}: no TQ data keys found after {max_wait_retries}s AND barrier write failed after {max_retries} retries. This rollout will block sample(). reward={reward}, data_id={data_id}, global_steps={global_steps}")
                             raise
+        else:
+            _t_wait_end = _t_wait_start
 
         print(f"[TQ6B-STORE] calling tq.async_kv_batch_get: keys={keys_to_update}", flush=True)
+        _t_get_start = now()
         existing = await tq.async_kv_batch_get(
             keys=keys_to_update, partition_id="train", select_fields=["responses"]
         )
+        _t_get_end = now()
         print(f"[TQ6B-STORE] kv_batch_get done, got {len(existing.get('responses', []))} responses", flush=True)
 
         response_ids_list = [existing["responses"][i] for i in range(len(keys_to_update))]
+        _t_build_start = now()
         fields = await asyncio.to_thread(_build_reward_tensors, response_ids_list, reward)
+        _t_build_end = now()
         print(f"[TQ6B-STORE] calling tq.async_kv_batch_put: keys={keys_to_update}", flush=True)
+        _t_update_start = now()
         await tq.async_kv_batch_put(
             keys=keys_to_update, partition_id="train", fields=fields,
         )
+        _t_update_end = now()
         print(f"[TQ6B-STORE] reward updated for {len(keys_to_update)} keys: {keys_to_update}", flush=True)
 
         barrier_tag = {"global_steps": global_steps, "status": "finished"}
@@ -1280,11 +1306,24 @@ class CollectionBasedLightningStore(LightningStore, Generic[T_collections]):
         for attempt in range(max_retries):
             try:
                 print(f"[TQ6B-STORE] calling tq.async_kv_put finished barrier (attempt {attempt+1}/{max_retries}): rollout_id={rollout_id}", flush=True)
+                _t_barrier_start = now()
                 await tq.async_kv_put(
                     key=rollout_id,
                     partition_id="train",
                     tag=barrier_tag,
                 )
+                _t_barrier_end = now()
+                bench_log("store_reward", global_steps, "store_update_reward",
+                    store_tq_init=_t_init_end - _t_init_start,
+                    store_tq_list=_t_list_end - _t_list_start,
+                    store_tq_wait=_t_wait_end - _t_wait_start,
+                    store_tq_get=_t_get_end - _t_get_start,
+                    store_build_tensors=_t_build_end - _t_build_start,
+                    store_tq_update=_t_update_end - _t_update_start,
+                    store_barrier_write=_t_barrier_end - _t_barrier_start,
+                    store_total=_t_barrier_end - _t0,
+                    n_keys=len(keys_to_update),
+                    rss_mb=rss_mb())
                 print(f"[TQ6B-STORE] reward+barrier written for rollout_id={rollout_id}", flush=True)
                 return
             except Exception as barrier_e:
