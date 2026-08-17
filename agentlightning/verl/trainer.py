@@ -289,6 +289,8 @@ class AgentLightningTrainer(RayPPOTrainer):
                 _gen_clear = _g5 - _g4
                 _gen_sleep = _g6 - _g5
 
+            _t_data_prep_start = _time.perf_counter()
+
             if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                 with _timer("gen_max", timing_raw):
                     gen_baseline_batch = deepcopy(gen_batch)
@@ -324,6 +326,8 @@ class AgentLightningTrainer(RayPPOTrainer):
 
             # for agent mode, pad the lengths to calculate old log prob, ref, and values
             batch, pad_size = pad_dataproto_to_divisor(batch, self.actor_rollout_wg.world_size)
+
+            _t_data_prep_end = _time.perf_counter()
 
             # recompute old_log_probs
             with _timer("old_log_prob", timing_raw):
@@ -461,6 +465,7 @@ class AgentLightningTrainer(RayPPOTrainer):
             gen_clear=round(_gen_clear, 2),
             gen_sleep_replicas=round(_gen_sleep, 2),
             gen_total=round(timing_raw.get("gen", 0), 2),
+            data_prep_total=round(_t_data_prep_end - _t_data_prep_start, 4),
             ppo_reward=round(timing_raw.get("reward", 0), 4),
             ppo_old_log_prob=round(timing_raw.get("old_log_prob", 0), 2),
             ppo_ref=round(timing_raw.get("ref", 0), 2),
