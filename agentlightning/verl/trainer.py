@@ -309,14 +309,12 @@ class AgentLightningTrainer(PPOTrainer):
                 _t4 = _time.time()
                 self.checkpoint_manager.sleep_replicas()
                 _t5 = _time.time()
-                _msg = f"[BENCH-STORE-REWARD] step={self.global_steps} gen breakdown: wake_replicas={_t1-_t0:.2f}s, set_up={_t2-_t1:.2f}s, replay_buffer.sample={_t3-_t2:.2f}s, clear={_t4-_t3:.2f}s, sleep_replicas={_t5-_t4:.2f}s, total_gen={_t5-_t0:.2f}s, n_triplets={len(batch.keys)}"
-                print(_msg)
-                with open("/home/ma-user/install/bench_store_reward.txt", "a") as _f:
-                    _f.write(_msg + "\n")
-                bench_log("store_reward", self.global_steps, "gen",
-                    gen_wake=_t1-_t0, gen_setup=_t2-_t1, gen_replay_sample=_t3-_t2,
-                    gen_clear=_t4-_t3, gen_sleep=_t5-_t4, gen_total=_t5-_t0,
-                    n_triplets=len(batch.keys), rss_mb=rss_mb())
+                timing_raw["gen_wake_replicas"] = round(_t1 - _t0, 2)
+                timing_raw["gen_set_up"] = round(_t2 - _t1, 2)
+                timing_raw["gen_replay_sample"] = round(_t3 - _t2, 2)
+                timing_raw["gen_clear"] = round(_t4 - _t3, 2)
+                timing_raw["gen_sleep_replicas"] = round(_t5 - _t4, 2)
+                timing_raw["n_triplets"] = len(batch.keys)
 
             _t_data_prep_start = _time.perf_counter()
 
@@ -534,9 +532,29 @@ class AgentLightningTrainer(PPOTrainer):
                     with open("/home/ma-user/install/bench_store_reward.txt", "a") as _f:
                         _f.write(_msg + "\n")
                     bench_log("store_reward", self.global_steps, "step",
-                        total_train_step=_step_t1-_step_t0, timing=timing_raw,
+                        total_step=round(_step_t1 - _step_t0, 2),
+                        gen_wake_replicas=round(timing_raw.get("gen_wake_replicas", 0), 2),
+                        gen_set_up=round(timing_raw.get("gen_set_up", 0), 2),
+                        gen_replay_sample=round(timing_raw.get("gen_replay_sample", 0), 2),
+                        gen_clear=round(timing_raw.get("gen_clear", 0), 2),
+                        gen_sleep_replicas=round(timing_raw.get("gen_sleep_replicas", 0), 2),
+                        gen_total=round(timing_raw.get("gen", 0), 2),
+                        n_triplets=timing_raw.get("n_triplets", 0),
                         data_prep_total=round(timing_raw.pop("data_prep_total", 0), 4),
-                        rss_mb=rss_mb())
+                        ppo_reward=round(timing_raw.get("reward", 0), 4),
+                        ppo_old_log_prob=round(timing_raw.get("old_log_prob", 0), 2),
+                        ppo_ref=round(timing_raw.get("ref", 0), 2),
+                        ppo_values=round(timing_raw.get("values", 0), 2),
+                        ppo_adv=round(timing_raw.get("adv", 0), 2),
+                        ppo_update_critic=round(timing_raw.get("update_critic", 0), 2),
+                        ppo_update_actor=round(timing_raw.get("update_actor", 0), 2),
+                        transit_dispatch_total=round(timing_raw.get("transit_dispatch_total", 0), 4),
+                        transit_execute_total=round(timing_raw.get("transit_execute_total", 0), 4),
+                        transit_ray_get_total=round(timing_raw.get("transit_ray_get_total", 0), 4),
+                        transit_collect_total=round(timing_raw.get("transit_collect_total", 0), 4),
+                        transit_total=round(timing_raw.get("transit_total", 0), 4),
+                        rss_mb=round(rss_mb(), 1),
+                    )
 
                     # save checkpoint
                     if self.config.trainer.save_freq > 0 and (
@@ -555,7 +573,7 @@ class AgentLightningTrainer(PPOTrainer):
                         with open("/home/ma-user/install/bench_store_reward.txt", "a") as _f:
                             _f.write(_msg + "\n")
                         bench_log("store_reward", self.global_steps, "update_weights",
-                            uw_total=_uw_t1-_uw_t0, rss_mb=rss_mb())
+                            update_weights=round(_uw_t1 - _uw_t0, 2))
 
                     # validate
                     if self.config.trainer.test_freq > 0 and (
