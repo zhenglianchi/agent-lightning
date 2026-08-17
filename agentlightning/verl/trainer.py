@@ -40,6 +40,7 @@ from verl.utils.tracking import Tracking
 from agentlightning.adapter import TraceAdapter, TraceToTripletBase
 from agentlightning.llm_proxy import LLMProxy
 from agentlightning.store.base import LightningStore
+from agentlightning.bench_detail import bench_log, now, rss_mb
 
 from .daemon import AgentModeDaemon
 
@@ -447,6 +448,26 @@ class AgentLightningTrainer(RayPPOTrainer):
         with open("/home/ma-user/install/bench_baseline.txt", "a") as _f:
             _f.write(_msg + "\n")
 
+        bench_log("baseline", self.global_steps, "step",
+            total_step=round(_step_t1 - _step_t0, 2),
+            gen_wake_replicas=round(_t1 - _t0, 2),
+            gen_set_up=round(_t2 - _t1, 2),
+            gen_run_until_all_finished=round(_t3 - _t2, 2),
+            gen_get_train_data_batch=round(_t4 - _t3, 2),
+            gen_clear=round(_t5 - _t4, 2),
+            gen_sleep_replicas=round(_t6 - _t5, 2),
+            gen_total=round(timing_raw.get("gen", 0), 2),
+            ppo_reward=round(timing_raw.get("reward", 0), 4),
+            ppo_old_log_prob=round(timing_raw.get("old_log_prob", 0), 2),
+            ppo_ref=round(timing_raw.get("ref", 0), 2),
+            ppo_values=round(timing_raw.get("values", 0), 2),
+            ppo_adv=round(timing_raw.get("adv", 0), 2),
+            ppo_update_critic=round(timing_raw.get("update_critic", 0), 2),
+            ppo_update_actor=round(timing_raw.get("update_actor", 0), 2),
+            n_triplets=metrics.get("training/n_triplets", 0),
+            rss_mb=round(rss_mb(), 1),
+        )
+
         return metrics
 
     def fit(self):
@@ -536,6 +557,12 @@ class AgentLightningTrainer(RayPPOTrainer):
                 ):
                     with _timer("save_checkpoint", timing_raw):
                         self._save_checkpoint()
+
+                _uw_t0 = now()
+                self.checkpoint_manager.update_weights(self.global_steps)
+                _uw_t1 = now()
+                bench_log("baseline", self.global_steps, "update_weights",
+                    update_weights=round(_uw_t1 - _uw_t0, 2))
 
                 # step metrics
                 metrics.update(

@@ -24,6 +24,7 @@ from agentlightning.adapter.triplet import TracerTraceToTriplet, TraceToTripletB
 from agentlightning.llm_proxy import LLMProxy, ModelConfig
 from agentlightning.store.base import LightningStore
 from agentlightning.types import EnqueueRolloutRequest, Rollout, RolloutConfig, Task
+from agentlightning.bench_detail import bench_log, now
 
 __all__ = [
     "AgentModeDaemon",
@@ -282,6 +283,9 @@ class AgentModeDaemon:
         self._server_thread: Optional[threading.Thread] = None
         self._proxy_thread: Optional[threading.Thread] = None
         self.is_train = True
+
+        self._bench_query_total = 0.0
+        self._bench_adapt_total = 0.0
 
     def _internal_loop_runner(self):
         """Run the internal loop."""
@@ -589,6 +593,8 @@ class AgentModeDaemon:
 
     def set_up_data_and_server(self, data: Dict[str, Any], server_addresses: List[str], is_train: bool = True):
         """Synchronous wrapper for setting up data and server resources."""
+        self._bench_query_total = 0.0
+        self._bench_adapt_total = 0.0
         coro = self._async_set_up(data, server_addresses, is_train)
 
         if self.mode == "v0":
@@ -629,14 +635,20 @@ class AgentModeDaemon:
         3. Final reward: extracted from last triplet's reward, searching backwards if not found
         """
         # Query spans for this rollout (latest attempt)
+        _tq = now()
         spans = await self.store.query_spans(rollout.rollout_id, attempt_id="latest")
+        _tq2 = now()
+        self._bench_query_total += (_tq2 - _tq)
 
         # Convert spans to triplets using the adapter
         if not spans:
             # No triplets found, will emit a warning later.
             triplets = []
         else:
+            _ta = now()
             triplets = self.adapter.adapt(spans)
+            _ta2 = now()
+            self._bench_adapt_total += (_ta2 - _ta)
 
         # Extract final reward from triplets
         final_reward: Optional[float] = None
@@ -1024,6 +1036,7 @@ class AgentModeDaemon:
             raise ValueError(f"Unknown trace_aggregator level: {self.trace_aggregator.get('level')}")
 
         n_transition = len(input_ids_list)
+        _t_build = now()
         batch_input_ids = torch.LongTensor(input_ids_list).to(device)
         input_attention_mask = torch.LongTensor(input_attention_mask_list).to(device)
         batch_response_ids = torch.LongTensor(response_ids_list).to(device)
@@ -1090,6 +1103,25 @@ class AgentModeDaemon:
             batch_size=n_transition,
         )
         data_proto = DataProto(batch=batch)
+        _t_build_end = now()
+
+        _seq_lens = [int(am.sum().item()) for am in attention_mask]
+        _padded_bytes = int(attention_mask.numel() * attention_mask.element_size())
+        _unpadded_bytes = int(sum(_seq_lens) * attention_mask.element_size())
+        _padding_ratio = (_padded_bytes - _unpadded_bytes) / max(_padded_bytes, 1)
+
+        bench_log("baseline", global_steps, "data_transfer",
+            query_spans_total=round(self._bench_query_total, 4),
+            adapt_total=round(self._bench_adapt_total, 4),
+            build_dataproto=round(_t_build_end - _t_build, 4),
+            n_triplets=n_transition,
+            padded_bytes=_padded_bytes,
+            unpadded_bytes=_unpadded_bytes,
+            padding_ratio=round(_padding_ratio, 4),
+            avg_seq_len=round(float(np.mean(_seq_lens)), 1) if _seq_lens else 0,
+            max_seq_len=max(_seq_lens) if _seq_lens else 0,
+            min_seq_len=min(_seq_lens) if _seq_lens else 0,
+        )
 
         data_metrics = {
             "training/reward": np.mean(list(finished_id_to_final_reward.values())),
