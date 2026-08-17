@@ -47,6 +47,7 @@ from agentlightning.types import (
 )
 from agentlightning.utils.system_snapshot import system_snapshot
 from agentlightning.adapter.triplet import TraceToTripletBase
+from agentlightning.bench_detail import bench_log, now
 if TYPE_CHECKING:
     from agentlightning.execution.events import ExecutionEvent
 
@@ -630,24 +631,46 @@ class LitAgentRunner(Runner[T_task]):
         """Rollout 完成后，只发 reward 到 LLMProxy /tq/reward 端点。"""
         import aiohttp
         import asyncio as _asyncio
+        import json as _json
+
+        _t_post_start = now()
+        _payload = {
+            "rollout_id": rollout_id,
+            "data_id": data_id,
+            "global_steps": global_steps,
+            "reward": reward,
+        }
+        _payload_bytes = len(_json.dumps(_payload).encode())
+        _n_retries = 0
 
         print(f"[TQ4-DEBUG] _post_reward_to_proxy: POSTing to {proxy_url}/tq/reward, rollout_id={rollout_id}, data_id={data_id}, global_steps={global_steps}, reward={reward}")
         max_retries = 3
         for attempt in range(max_retries):
             try:
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-                    resp = await session.post(f"{proxy_url}/tq/reward", json={
-                        "rollout_id": rollout_id,
-                        "data_id": data_id,
-                        "global_steps": global_steps,
-                        "reward": reward,
-                    })
+                    resp = await session.post(f"{proxy_url}/tq/reward", json=_payload)
                     print(f"[TQ4-DEBUG] _post_reward_to_proxy: response status={resp.status}, body={await resp.text()}")
+                    _t_post_end = now()
+                    bench_log("dualwrite", global_steps, "http_callback",
+                        http_post_total=round(_t_post_end - _t_post_start, 4),
+                        http_retries=_n_retries,
+                        http_payload_bytes=_payload_bytes,
+                        rollout_id=rollout_id,
+                    )
                     return
             except Exception as e:
+                _n_retries += 1
                 print(f"[TQ4-DEBUG] _post_reward_to_proxy: attempt {attempt+1}/{max_retries} failed: {e}")
                 if attempt < max_retries - 1:
                     await _asyncio.sleep(2)
+        _t_post_end = now()
+        bench_log("dualwrite", global_steps, "http_callback",
+            http_post_total=round(_t_post_end - _t_post_start, 4),
+            http_retries=_n_retries,
+            http_payload_bytes=_payload_bytes,
+            rollout_id=rollout_id,
+            failed=True,
+        )
         logger.error(f"Failed to POST reward to proxy after {max_retries} attempts: rollout_id={rollout_id}")
 
     @staticmethod

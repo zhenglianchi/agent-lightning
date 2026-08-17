@@ -41,6 +41,7 @@ from verl.utils.tracking import Tracking
 from agentlightning.adapter import TraceAdapter, TraceToTripletBase
 from agentlightning.llm_proxy import LLMProxy
 from agentlightning.store.base import LightningStore
+from agentlightning.bench_detail import bench_log, now, rss_mb
 
 from .daemon import AgentModeDaemon
 
@@ -309,6 +310,16 @@ class AgentLightningTrainer(PPOTrainer):
                 with open("/home/ma-user/install/bench_dualwrite.txt", "a") as _f:
                     _f.write(_msg + "\n")
 
+                bench_log("dualwrite", self.global_steps, "gen",
+                    wake_replicas=round(_t1 - _t0, 2),
+                    set_up=round(_t2 - _t1, 2),
+                    replay_buffer_sample=round(_t3 - _t2, 2),
+                    clear=round(_t4 - _t3, 2),
+                    sleep_replicas=round(_t5 - _t4, 2),
+                    total_gen=round(_t5 - _t0, 2),
+                    n_triplets=len(batch.keys),
+                )
+
             '''
             TODO: 后续实现
             if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
@@ -498,6 +509,19 @@ class AgentLightningTrainer(PPOTrainer):
                     with open("/home/ma-user/install/bench_dualwrite.txt", "a") as _f:
                         _f.write(_msg + "\n")
 
+                    bench_log("dualwrite", self.global_steps, "step",
+                        total_step=round(_step_t1 - _step_t0, 2),
+                        gen=round(timing_raw.get("gen", 0), 2),
+                        reward=round(timing_raw.get("reward", 0), 4),
+                        old_log_prob=round(timing_raw.get("old_log_prob", 0), 2),
+                        ref=round(timing_raw.get("ref", 0), 2),
+                        values=round(timing_raw.get("values", 0), 2),
+                        adv=round(timing_raw.get("adv", 0), 2),
+                        update_critic=round(timing_raw.get("update_critic", 0), 2),
+                        update_actor=round(timing_raw.get("update_actor", 0), 2),
+                        rss_mb=round(rss_mb(), 1),
+                    )
+
                     # save checkpoint
                     if self.config.trainer.save_freq > 0 and (
                         is_last_step or self.global_steps % self.config.trainer.save_freq == 0
@@ -514,6 +538,9 @@ class AgentLightningTrainer(PPOTrainer):
                         print(_msg)
                         with open("/home/ma-user/install/bench_dualwrite.txt", "a") as _f:
                             _f.write(_msg + "\n")
+
+                        bench_log("dualwrite", self.global_steps, "update_weights",
+                            update_weights=round(_uw_t1 - _uw_t0, 2))
 
                     # validate
                     if self.config.trainer.test_freq > 0 and (

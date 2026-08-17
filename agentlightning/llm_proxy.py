@@ -49,6 +49,7 @@ from starlette.types import Scope
 
 from agentlightning.semconv import LightningResourceAttributes
 from agentlightning.types import LLM, ProxyLLM
+from agentlightning.bench_detail import bench_log, now
 from agentlightning.utils.server_launcher import (
     LaunchMode,
     PythonServerLauncher,
@@ -1245,6 +1246,7 @@ class LLMProxy:
 
         @app.post("/tq/reward")
         async def tq_reward(request: Request):
+            _t_total_start = now()
             body = await request.json()
             rollout_id = body["rollout_id"]
             global_steps = body["global_steps"]
@@ -1268,7 +1270,9 @@ class LLMProxy:
                 return {"status": "ok", "warning": "no_cached_spans"}
 
             # 2. 一次性 adapt 所有 spans → triplets
+            _t_adapt_start = now()
             triplets = proxy_self._adapter.adapt(spans)
+            _t_adapt_end = now()
             print(f"[TQ4-DEBUG] /tq/reward: adapter produced {len(triplets)} triplets")
             if not triplets:
                 logger.warning(f"/tq/reward: Adapter returned empty triplets for rollout {rollout_id}, writing finished barrier only.")
@@ -1331,24 +1335,46 @@ class LLMProxy:
             # 4. 写 TQ 数据 keys（用 async 版本避免阻塞事件循环）
             if fields_list:
                 print(f"[TQ4-DEBUG] /tq/reward: building tensordict from {len(fields_list)} fields")
+                _t_build_start = now()
                 fields = list_of_dict_to_tensordict(fields_list)
+                _t_build_end = now()
                 print(f"[TQ4-DEBUG] /tq/reward: calling tq.async_kv_batch_put, keys={keys}")
+                _t_tq_write_start = now()
                 await tq.async_kv_batch_put(
                     keys=keys,
                     partition_id="train",
                     fields=fields,
                     tags=tags,
                 )
+                _t_tq_write_end = now()
                 print(f"[TQ4-DEBUG] /tq/reward: wrote {len(fields_list)} data keys to TQ, keys={keys}")
 
             # 5. 写 uid barrier（通知 ReplayBuffer 该 rollout 已完成）
             print(f"[TQ4-DEBUG] /tq/reward: calling tq.async_kv_put finished barrier for rollout_id={rollout_id}")
+            _t_barrier_start = now()
             await tq.async_kv_put(
                 key=rollout_id,
                 partition_id="train",
                 tag={"global_steps": global_steps, "status": "finished"},
             )
+            _t_barrier_end = now()
+            _t_total_end = now()
             print(f"[TQ4-DEBUG] /tq/reward: wrote finished barrier for rollout_id={rollout_id}")
+
+            _seq_lens = [t.get("seq_len", 0) for t in tags] if tags else []
+            bench_log("dualwrite", global_steps, "proxy_tq_write",
+                proxy_adapt=round(_t_adapt_end - _t_adapt_start, 4),
+                proxy_build=round(_t_build_end - _t_build_start, 4) if fields_list else 0,
+                proxy_tq_write=round(_t_tq_write_end - _t_tq_write_start, 4) if fields_list else 0,
+                proxy_barrier_write=round(_t_barrier_end - _t_barrier_start, 4),
+                proxy_total=round(_t_total_end - _t_total_start, 4),
+                n_triplets=len(fields_list) if fields_list else 0,
+                rollout_id=rollout_id,
+                unpadded_bytes=sum(sl * 4 for sl in _seq_lens),
+                avg_seq_len=round(float(np.mean(_seq_lens)), 1) if _seq_lens else 0,
+                max_seq_len=max(_seq_lens) if _seq_lens else 0,
+                min_seq_len=min(_seq_lens) if _seq_lens else 0,
+            )
 
             return {"status": "ok", "triplets_written": len(fields_list)}
     
