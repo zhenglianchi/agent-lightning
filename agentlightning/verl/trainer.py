@@ -378,6 +378,7 @@ class AgentLightningTrainer(PPOTrainer):
             print("padding: ", len(batch.tags))
 
             _t_data_prep_end = _time.perf_counter()
+            timing_raw["data_prep_total"] = _t_data_prep_end - _t_data_prep_start
 
             # ===== 4. Compute old log prob =====
             # PPOTrainer版：内部计算entropy，直接 metrics.update({"actor/entropy": ...})
@@ -508,7 +509,7 @@ class AgentLightningTrainer(PPOTrainer):
                         _f.write(_msg + "\n")
                     bench_log("store_reward", self.global_steps, "step",
                         total_train_step=_step_t1-_step_t0, timing=timing_raw,
-                        data_prep_total=round(_t_data_prep_end - _t_data_prep_start, 4),
+                        data_prep_total=round(timing_raw.pop("data_prep_total", 0), 4),
                         rss_mb=rss_mb())
 
                     # save checkpoint
