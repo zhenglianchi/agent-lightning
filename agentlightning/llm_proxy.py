@@ -1262,10 +1262,20 @@ class LLMProxy:
             print(f"[TQ4-DEBUG] /tq/reward: popped {len(spans)} spans for rollout_id={rollout_id}")
             if not spans:
                 logger.warning(f"/tq/reward: No cached spans for rollout {rollout_id}, writing finished barrier only.")
+                _t_barrier_start = now()
                 tq.kv_put(
                     key=rollout_id,
                     partition_id="train",
                     tag={"global_steps": global_steps, "status": "finished"},
+                )
+                _t_barrier_end = now()
+                _t_total_end = now()
+                bench_log("dualwrite", global_steps, "proxy_tq_write",
+                    proxy_adapt=0,
+                    proxy_barrier_write=round(_t_barrier_end - _t_barrier_start, 4),
+                    proxy_total=round(_t_total_end - _t_total_start, 4),
+                    n_triplets=0,
+                    rollout_id=rollout_id,
                 )
                 return {"status": "ok", "warning": "no_cached_spans"}
 
@@ -1276,10 +1286,20 @@ class LLMProxy:
             print(f"[TQ4-DEBUG] /tq/reward: adapter produced {len(triplets)} triplets")
             if not triplets:
                 logger.warning(f"/tq/reward: Adapter returned empty triplets for rollout {rollout_id}, writing finished barrier only.")
+                _t_barrier_start = now()
                 tq.kv_put(
                     key=rollout_id,
                     partition_id="train",
                     tag={"global_steps": global_steps, "status": "finished"},
+                )
+                _t_barrier_end = now()
+                _t_total_end = now()
+                bench_log("dualwrite", global_steps, "proxy_tq_write",
+                    proxy_adapt=round(_t_adapt_end - _t_adapt_start, 4),
+                    proxy_barrier_write=round(_t_barrier_end - _t_barrier_start, 4),
+                    proxy_total=round(_t_total_end - _t_total_start, 4),
+                    n_triplets=0,
+                    rollout_id=rollout_id,
                 )
                 return {"status": "ok", "warning": "empty_triplets"}
 
@@ -1370,7 +1390,7 @@ class LLMProxy:
                 proxy_total=round(_t_total_end - _t_total_start, 4),
                 n_triplets=len(fields_list) if fields_list else 0,
                 rollout_id=rollout_id,
-                unpadded_bytes=sum(sl * 4 for sl in _seq_lens),
+                unpadded_bytes=sum(sl * 8 for sl in _seq_lens),
                 avg_seq_len=round(float(np.mean(_seq_lens)), 1) if _seq_lens else 0,
                 max_seq_len=max(_seq_lens) if _seq_lens else 0,
                 min_seq_len=min(_seq_lens) if _seq_lens else 0,
