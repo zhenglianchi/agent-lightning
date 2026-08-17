@@ -37,6 +37,7 @@ from verl.utils.tracking import Tracking
 from agentlightning.adapter import TraceAdapter, TraceToTripletBase
 from agentlightning.llm_proxy import LLMProxy
 from agentlightning.store.base import LightningStore
+from agentlightning.bench_detail import bench_log, now, rss_mb
 
 from .daemon import AgentModeDaemon
 
@@ -238,6 +239,9 @@ class AgentLightningTrainer(RayPPOTrainer):
 
     def _train_step(self, batch_dict: dict) -> dict:
         # Isolate in a separate method to automatically recycle the variables before validation.
+        import time as _time
+        _step_t0 = _time.perf_counter()
+        _rss0 = rss_mb()
         batch: DataProto = DataProto.from_single_dict(batch_dict)
         metrics = {}
         timing_raw = {}
@@ -249,11 +253,15 @@ class AgentLightningTrainer(RayPPOTrainer):
 
             # generate a batch
             with _timer("gen", timing_raw):
+                _g0 = _time.perf_counter()
                 self.async_rollout_manager.wake_up()
+                _g1 = _time.perf_counter()
                 self.agent_mode_daemon.set_up_data_and_server(
                     gen_batch.non_tensor_batch, self.async_rollout_manager.server_addresses
                 )
+                _g2 = _time.perf_counter()
                 self.agent_mode_daemon.run_until_all_finished()
+                _g3 = _time.perf_counter()
                 batch, agent_metrics = self.agent_mode_daemon.get_train_data_batch(
                     max_prompt_length=(
                         self.config.agentlightning.trace_aggregator.trajectory_max_prompt_length
@@ -268,9 +276,18 @@ class AgentLightningTrainer(RayPPOTrainer):
                     device=gen_batch.batch["fake_ids"].device,
                     global_steps=self.global_steps,
                 )
+                _g4 = _time.perf_counter()
                 metrics.update(agent_metrics)
                 self.agent_mode_daemon.clear_data_and_server()
+                _g5 = _time.perf_counter()
                 self.async_rollout_manager.sleep()
+                _g6 = _time.perf_counter()
+                _gen_wake = _g1 - _g0
+                _gen_setup = _g2 - _g1
+                _gen_run = _g3 - _g2
+                _gen_get = _g4 - _g3
+                _gen_clear = _g5 - _g4
+                _gen_sleep = _g6 - _g5
 
             if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                 with _timer("gen_max", timing_raw):
@@ -433,6 +450,28 @@ class AgentLightningTrainer(RayPPOTrainer):
         n_gpus = self.resource_pool_manager.get_n_gpus()
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
 
+        _step_t1 = _time.perf_counter()
+        _rss1 = rss_mb()
+        bench_log("main", self.global_steps, "step",
+            total_step=round(_step_t1 - _step_t0, 2),
+            gen_wake_replicas=round(_gen_wake, 2),
+            gen_set_up=round(_gen_setup, 2),
+            gen_run_until_all_finished=round(_gen_run, 2),
+            gen_get_train_data_batch=round(_gen_get, 2),
+            gen_clear=round(_gen_clear, 2),
+            gen_sleep_replicas=round(_gen_sleep, 2),
+            gen_total=round(timing_raw.get("gen", 0), 2),
+            ppo_reward=round(timing_raw.get("reward", 0), 4),
+            ppo_old_log_prob=round(timing_raw.get("old_log_prob", 0), 2),
+            ppo_ref=round(timing_raw.get("ref", 0), 2),
+            ppo_values=round(timing_raw.get("values", 0), 2),
+            ppo_adv=round(timing_raw.get("adv", 0), 2),
+            ppo_update_critic=round(timing_raw.get("update_critic", 0), 2),
+            ppo_update_actor=round(timing_raw.get("update_actor", 0), 2),
+            n_triplets=metrics.get("training/n_triplets", 0),
+            rss_mb=round(max(_rss0, _rss1), 1),
+        )
+
         return metrics
 
     def fit(self):
@@ -523,6 +562,15 @@ class AgentLightningTrainer(RayPPOTrainer):
                 ):
                     with _timer("save_checkpoint", timing_raw):
                         self._save_checkpoint()
+
+                # update weights
+                _uw_t0 = now()
+                self.async_rollout_manager.wake_up()
+                if hasattr(self, 'actor_rollout_wg') and self.actor_rollout_wg is not None:
+                    self.actor_rollout_wg.update_policy.remote() if hasattr(self.actor_rollout_wg, 'update_policy') else None
+                _uw_t1 = now()
+                bench_log("main", self.global_steps, "update_weights",
+                    update_weights=round(_uw_t1 - _uw_t0, 2))
 
                 # step metrics
                 metrics.update(
