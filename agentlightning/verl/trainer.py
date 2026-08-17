@@ -37,6 +37,7 @@ from verl.trainer.ppo.ray_trainer import (
 )
 from verl.utils.metric import reduce_metrics
 from verl.utils.tracking import Tracking
+from verl.single_controller.ray.base import reset_data_transit_timings, get_data_transit_timings
 
 from agentlightning.adapter import TraceAdapter, TraceToTripletBase
 from agentlightning.llm_proxy import LLMProxy
@@ -386,6 +387,8 @@ class AgentLightningTrainer(PPOTrainer):
             _t_data_prep_end = _time.perf_counter()
             timing_raw["data_prep_total"] = _t_data_prep_end - _t_data_prep_start
 
+            reset_data_transit_timings()
+
             # ===== 4. Compute old log prob =====
             # PPOTrainer版：内部计算entropy，直接 metrics.update({"actor/entropy": ...})
             # 不再需要手动从返回值提取 entropy
@@ -418,6 +421,26 @@ class AgentLightningTrainer(PPOTrainer):
                 # update actor
                 with _timer("update_actor", timing_raw):
                     batch = self._update_actor(batch, metrics=metrics)
+
+            _dt = get_data_transit_timings()
+            _transit_dispatch = 0.0
+            _transit_execute = 0.0
+            _transit_ray_get = 0.0
+            _transit_collect = 0.0
+            for _m, _t in _dt.items():
+                timing_raw[f"transit_{_m}_dispatch"] = round(_t["dispatch"], 4)
+                timing_raw[f"transit_{_m}_execute"] = round(_t["execute"], 4)
+                timing_raw[f"transit_{_m}_ray_get"] = round(_t["ray_get"], 4)
+                timing_raw[f"transit_{_m}_collect"] = round(_t["collect"], 4)
+                _transit_dispatch += _t["dispatch"]
+                _transit_execute += _t["execute"]
+                _transit_ray_get += _t["ray_get"]
+                _transit_collect += _t["collect"]
+            timing_raw["transit_dispatch_total"] = round(_transit_dispatch, 4)
+            timing_raw["transit_execute_total"] = round(_transit_execute, 4)
+            timing_raw["transit_ray_get_total"] = round(_transit_ray_get, 4)
+            timing_raw["transit_collect_total"] = round(_transit_collect, 4)
+            timing_raw["transit_total"] = round(_transit_dispatch + _transit_execute + _transit_ray_get + _transit_collect, 4)
 
         return batch
 
