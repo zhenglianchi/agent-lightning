@@ -499,6 +499,11 @@ class AgentLightningTrainer(RayPPOTrainer):
             ppo_adv=round(timing_raw.get("adv", 0), 2),
             ppo_update_critic=round(timing_raw.get("update_critic", 0), 2),
             ppo_update_actor=round(timing_raw.get("update_actor", 0), 2),
+            transit_dispatch_total=round(timing_raw.get("transit_dispatch_total", 0), 4),
+            transit_execute_total=round(timing_raw.get("transit_execute_total", 0), 4),
+            transit_ray_get_total=round(timing_raw.get("transit_ray_get_total", 0), 4),
+            transit_collect_total=round(timing_raw.get("transit_collect_total", 0), 4),
+            transit_total=round(timing_raw.get("transit_total", 0), 4),
             n_triplets=metrics.get("training/n_triplets", 0),
             rss_mb=round(rss_mb(), 1),
         )
