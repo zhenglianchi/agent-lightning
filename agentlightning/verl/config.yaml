@@ -17,6 +17,7 @@ agentlightning:
 
 data:
   filter_overlong_prompts: false
+  seed: 42
 
 actor_rollout_ref:
   rollout:

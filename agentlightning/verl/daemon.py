@@ -516,13 +516,15 @@ class AgentModeDaemon:
                 endpoint=f"http://127.0.0.1:{self.proxy_port}/v1",
                 model=self.train_information.get("model", "default-model"),
                 sampling_parameters={
-                    "temperature": self.train_information.get("temperature", 0.7 if is_train else 0.0)
+                    "temperature": self.train_information.get("temperature", 0.7 if is_train else 0.0),
+                    "seed": 42,
                 },
             )
         else:
             llm_resource = self.llm_proxy.as_resource(
                 sampling_parameters={
-                    "temperature": self.train_information.get("temperature", 0.7 if is_train else 0.0)
+                    "temperature": self.train_information.get("temperature", 0.7 if is_train else 0.0),
+                    "seed": 42,
                 },
             )
 
