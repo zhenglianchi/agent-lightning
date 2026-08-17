@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import math
+
 import random
 from contextlib import contextmanager
 from copy import deepcopy
@@ -14,8 +16,10 @@ import numpy as np
 import torch
 import verl
 from codetiming import Timer
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 from tqdm import tqdm
+import transfer_queue as tq
+from transfer_queue import KVBatchMeta
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.trainer.ppo.core_algos import agg_loss
@@ -24,9 +28,9 @@ from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
 )
+from verl.trainer.main_ppo_sync import PPOTrainer
 from verl.trainer.ppo.ray_trainer import (
     AdvantageEstimator,
-    RayPPOTrainer,
     apply_kl_penalty,
     compute_advantage,
     compute_response_mask,
@@ -57,7 +61,7 @@ def _timer(name: str, timing_raw: Dict[str, float]):
 
 # This function is adapted from verl.
 # We introduce a new parameter `suffix` to distinguish between metrics computed
-# before and after AgentLightning’s post-processing.
+# before and after AgentLightning鈥檚 post-processing.
 # - "Before" refers to raw reward and advantage values.
 # - "After" refers to values computed following post-processing, which involves:
 #     (1) Dropping prompts that exceed the maximum allowed length.
@@ -157,21 +161,14 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True, suffix: str 
     return metrics
 
 
-class AgentLightningTrainer(RayPPOTrainer):
+class AgentLightningTrainer(PPOTrainer):
     """
     Specialized PPO trainer for agent-based reinforcement learning.
 
     This trainer is designed specifically for scenarios where the model interacts with
     external environments, tools, or APIs through an AgentLightningServer. It simplifies
     the training loop by removing the complex conditional logic present in the original
-    RayPPOTrainer and focusing on the agent mode workflow.
-
-    Key differences from RayPPOTrainer:
-
-    1. Uses AgentModeDaemon for server communication
-    2. Simplified data flow without pop/union operations
-    3. Direct batch processing through agent daemon
-    4. Streamlined validation using agent_mode validation
+    PPOTrainer and focusing on the agent mode workflow.
     """
 
     def __init__(
@@ -180,13 +177,86 @@ class AgentLightningTrainer(RayPPOTrainer):
         llm_proxy: LLMProxy | None,
         adapter: TraceAdapter | None,
         daemon_cls: Type[AgentModeDaemon],
+        train_dataset=None,
+        val_dataset=None,
         **kwargs,
     ):
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
         super().__init__(**kwargs)
         self.store = store
         self.llm_proxy = llm_proxy
         self.adapter = adapter
         self.daemon_cls = daemon_cls
+
+    def _init_dataloader(self):
+        from verl.trainer.main_ppo_sync import create_rl_sampler
+        from verl.utils.dataset.rl_dataset import collate_fn
+        from torchdata.stateful_dataloader import StatefulDataLoader
+        from .dataset import AgentDataset, LoadedDataset
+
+        if self.train_dataset is not None:
+            self.train_dataset = LoadedDataset(self.train_dataset)
+        else:
+            self.train_dataset = AgentDataset(
+                data_files=self.config.data.train_files,
+                tokenizer=self.tokenizer,
+                processor=self.processor,
+                config=self.config.data,
+            )
+
+        if self.val_dataset is not None:
+            self.val_dataset = LoadedDataset(self.val_dataset)
+        else:
+            self.val_dataset = AgentDataset(
+                data_files=self.config.data.val_files,
+                tokenizer=self.tokenizer,
+                processor=self.processor,
+                config=self.config.data,
+            )
+
+        train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
+        num_workers = self.config.data["dataloader_num_workers"]
+
+        self.train_dataloader = StatefulDataLoader(
+            dataset=self.train_dataset,
+            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+            num_workers=num_workers,
+            drop_last=True,
+            collate_fn=collate_fn,
+            sampler=train_sampler,
+        )
+
+        val_batch_size = self.config.data.val_batch_size
+        if val_batch_size is None:
+            val_batch_size = len(self.val_dataset)
+
+        self.val_dataloader = StatefulDataLoader(
+            dataset=self.val_dataset,
+            batch_size=val_batch_size,
+            num_workers=num_workers,
+            shuffle=self.config.data.get("validation_shuffle", True),
+            drop_last=False,
+            collate_fn=collate_fn,
+        )
+
+        assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
+        assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
+
+        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
+        if self.config.trainer.total_training_steps is not None:
+            total_training_steps = self.config.trainer.total_training_steps
+        self.total_training_steps = total_training_steps
+
+        try:
+            OmegaConf.set_struct(self.config, True)
+            with open_dict(self.config):
+                if OmegaConf.select(self.config, "actor_rollout_ref.actor.optim"):
+                    self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
+                if OmegaConf.select(self.config, "critic.optim"):
+                    self.config.critic.optim.total_training_steps = total_training_steps
+        except Exception as e:
+            print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
     def _validate(self):
         assert len(self.val_dataloader) == 1, "Please set val_batch_size to None for better throughput."
@@ -194,103 +264,63 @@ class AgentLightningTrainer(RayPPOTrainer):
         test_data = next(iter(self.val_dataloader))
         test_batch = DataProto.from_single_dict(test_data)
 
-        self.async_rollout_manager.wake_up()
+        self.checkpoint_manager.wake_up_replicas()
         self.agent_mode_daemon.set_up_data_and_server(
             test_batch.non_tensor_batch,
-            self.async_rollout_manager.server_addresses,
+            self.llm_server_manager.get_addresses(),
             is_train=False,
         )
         self.agent_mode_daemon.run_until_all_finished()
         test_metrics = self.agent_mode_daemon.get_test_metrics()
         self.agent_mode_daemon.clear_data_and_server()
-        self.async_rollout_manager.sleep()
+        self.checkpoint_manager.sleep_replicas()
         return test_metrics
 
-    def _compute_reference_log_prob(self, batch: DataProto) -> DataProto:
-        """Compute reference log probability using the correct worker based on LoRA configuration.
-
-        In verl 0.6.0+, when LoRA is detected (indicated by ref_in_actor=True),
-        the reference policy is computed by the actor rollout worker instead of a separate
-        ref policy worker. This method handles both scenarios by checking the ref_in_actor flag.
-        Note: verl sets ref_in_actor=True when it detects LoRA configuration (e.g., lora_rank > 0 or lora_adapter_path is set).
-
-        Args:
-            batch: The data batch to compute reference log probabilities for.
-
-        Returns:
-            DataProto with reference log probabilities added.
-
-        Raises:
-            RuntimeError: If the required worker is not available.
-        """
-        if getattr(self, "ref_in_actor", False):
-            actor_worker = getattr(self, "actor_rollout_wg", None)
-            if actor_worker is None:
-                raise RuntimeError("actor_rollout_wg is required when ref_in_actor is True.")
-            return actor_worker.compute_ref_log_prob(batch)
-
-        ref_worker = getattr(self, "ref_policy_wg", None)
-        if ref_worker is None:
-            raise RuntimeError(
-                "Reference policy worker was not initialized. "
-                "Ensure `use_reference_policy` is enabled and the VERL config exposes the ref worker."
-            )
-        return ref_worker.compute_ref_log_prob(batch)
-
-    def _train_step(self, batch_dict: dict) -> dict:
+    def _train_step(self, batch_dict: dict, metrics: dict, timing_raw: dict) -> KVBatchMeta:
         # Isolate in a separate method to automatically recycle the variables before validation.
         import time as _time
         _step_t0 = _time.perf_counter()
         _rss0 = rss_mb()
         batch: DataProto = DataProto.from_single_dict(batch_dict)
-        metrics = {}
-        timing_raw = {}
 
         with _timer("step", timing_raw):
 
-            # When agent mode is enabled, we read the batch as it is.
+            # ===== 1. Rollout（daemon替代async_rollout_manager） =====
             gen_batch = batch
 
             # generate a batch
             with _timer("gen", timing_raw):
-                _g0 = _time.perf_counter()
-                self.async_rollout_manager.wake_up()
-                _g1 = _time.perf_counter()
+                import time as _time
+                _t0 = _time.time()
+                self.checkpoint_manager.wake_up_replicas()
+                _t1 = _time.time()
+                # ===== 新逻辑：TQ 双写 =====
                 self.agent_mode_daemon.set_up_data_and_server(
-                    gen_batch.non_tensor_batch, self.async_rollout_manager.server_addresses
-                )
-                _g2 = _time.perf_counter()
-                self.agent_mode_daemon.run_until_all_finished()
-                _g3 = _time.perf_counter()
-                batch, agent_metrics = self.agent_mode_daemon.get_train_data_batch(
-                    max_prompt_length=(
-                        self.config.agentlightning.trace_aggregator.trajectory_max_prompt_length
-                        if self.config.agentlightning.trace_aggregator.level.startswith("trajectory")
-                        else self.config.data.max_prompt_length
-                    ),
-                    max_response_length=(
-                        self.config.agentlightning.trace_aggregator.trajectory_max_response_length
-                        if self.config.agentlightning.trace_aggregator.level.startswith("trajectory")
-                        else self.config.data.max_response_length
-                    ),
-                    device=gen_batch.batch["fake_ids"].device,
+                    gen_batch.non_tensor_batch, self.llm_server_manager.get_addresses(),
                     global_steps=self.global_steps,
                 )
-                _g4 = _time.perf_counter()
-                metrics.update(agent_metrics)
+                _t2 = _time.time()
+                batch = self.replay_buffer.sample(
+                    partition_id="train", global_steps=self.global_steps
+                )
+                _t3 = _time.time()
                 self.agent_mode_daemon.clear_data_and_server()
-                _g5 = _time.perf_counter()
-                self.async_rollout_manager.sleep()
-                _g6 = _time.perf_counter()
-                _gen_wake = _g1 - _g0
-                _gen_setup = _g2 - _g1
-                _gen_run = _g3 - _g2
-                _gen_get = _g4 - _g3
-                _gen_clear = _g5 - _g4
-                _gen_sleep = _g6 - _g5
+                _t4 = _time.time()
+                self.checkpoint_manager.sleep_replicas()
+                _t5 = _time.time()
+                _msg = f"[BENCH-STORE-REWARD] step={self.global_steps} gen breakdown: wake_replicas={_t1-_t0:.2f}s, set_up={_t2-_t1:.2f}s, replay_buffer.sample={_t3-_t2:.2f}s, clear={_t4-_t3:.2f}s, sleep_replicas={_t5-_t4:.2f}s, total_gen={_t5-_t0:.2f}s, n_triplets={len(batch.keys)}"
+                print(_msg)
+                with open("/home/ma-user/install/bench_store_reward.txt", "a") as _f:
+                    _f.write(_msg + "\n")
+                bench_log("store_reward", self.global_steps, "gen",
+                    gen_wake=_t1-_t0, gen_setup=_t2-_t1, gen_replay_sample=_t3-_t2,
+                    gen_clear=_t4-_t3, gen_sleep=_t5-_t4, gen_total=_t5-_t0,
+                    n_triplets=len(batch.keys), rss_mb=rss_mb())
 
             _t_data_prep_start = _time.perf_counter()
 
+            '''
+            TODO: 后续实现
             if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                 with _timer("gen_max", timing_raw):
                     gen_baseline_batch = deepcopy(gen_batch)
@@ -310,176 +340,93 @@ class AgentLightningTrainer(RayPPOTrainer):
             # uid is used for algorithm like GRPO, should be aligned to data id
             batch.non_tensor_batch["uid"] = batch.non_tensor_batch["data_id_list"]
 
+            
             if "response_mask" not in batch.batch:
                 batch.batch["response_mask"] = compute_response_mask(batch)
 
             # compute global_valid tokens
             batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+            batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+            '''
 
             with _timer("reward", timing_raw):
                 # compute reward model score
-                if self.use_rm:
-                    reward_tensor = self.rm_wg.compute_rm_score(batch)
-                    batch = batch.union(reward_tensor)
+                if self.reward_loop_manager.reward_loop_worker_handles is None:
+                    # 这里是todo，目前verl0.8.0中也没做
+                    batch = self._compute_reward_colocate(batch)
 
-                reward_extra_infos_dict = {}
+            '''if self.config.algorithm.adv_estimator == core_algos.AdvantageEstimator.REMAX:
+                batch = self._add_remax_reward_baselines(batch)'''
 
-            # for agent mode, pad the lengths to calculate old log prob, ref, and values
-            batch, pad_size = pad_dataproto_to_divisor(batch, self.actor_rollout_wg.world_size)
-
-            _t_data_prep_end = _time.perf_counter()
-
-            # recompute old_log_probs
-            with _timer("old_log_prob", timing_raw):
-                old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                entropys = old_log_prob.batch["entropys"]
-                response_masks = batch.batch["response_mask"]
-                loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
-                metrics.update(old_log_prob_metrics)
-                old_log_prob.batch.pop("entropys")
-                batch = batch.union(old_log_prob)
-
-            if self.use_reference_policy:
-                # compute reference log_prob
-                with _timer("ref", timing_raw):
-                    ref_log_prob = self._compute_reference_log_prob(batch)
-                    batch = batch.union(ref_log_prob)
-
-            # compute values
-            if self.use_critic:
-                with _timer("values", timing_raw):
-                    values = self.critic_wg.compute_values(batch)
-                    batch = batch.union(values)
-
-            # for agent mode, unpad to calculate adv
-            # it is important, as adv should be based on the raw traces
-            batch = unpad_dataproto(batch, pad_size=pad_size)
-
-            with _timer("adv", timing_raw):
-                # if agent_mode is enabled, there is already token_level_scores
-                # token_level_scores is not needed to compute here
-
-                # compute rewards. apply_kl_penalty if available
-                if self.config.algorithm.use_kl_in_reward:
-                    batch, kl_metrics = apply_kl_penalty(
-                        batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
-                    )
-                    metrics.update(kl_metrics)
-                else:
-                    batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
-                # compute advantages, executed on the driver process
-
-                norm_adv_by_std_in_grpo = self.config.algorithm.get(
-                    "norm_adv_by_std_in_grpo", True
-                )  # GRPO adv normalization factor
-
-                batch = compute_advantage(
-                    batch,
-                    adv_estimator=self.config.algorithm.adv_estimator,
-                    gamma=self.config.algorithm.gamma,
-                    lam=self.config.algorithm.lam,
-                    num_repeat=self.config.actor_rollout_ref.rollout.n,
-                    norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                    config=self.config.algorithm,
+            # ===== 2. 过滤is_drop样本（替代原来的is_drop_mask过滤） =====
+            non_drop_mask = [not tag.get("is_drop", False) for tag in batch.tags]
+            if not all(non_drop_mask):
+                valid_indices = [i for i, m in enumerate(non_drop_mask) if m]
+                metrics["training/n_triplets_prompt_too_long"] = len(batch.keys) - len(valid_indices)
+                print("valid_indices: ", len(valid_indices))
+                batch = KVBatchMeta(
+                    keys=[batch.keys[i] for i in valid_indices],
+                    tags=[batch.tags[i] for i in valid_indices],
+                    partition_id=batch.partition_id,
+                    fields=batch.fields,
+                    extra_info=batch.extra_info,
                 )
 
-            # Calculate the metrics before processing. Refer to the comments of function `compute_data_metrics` for details.
-            metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic, suffix="_before_processing"))
+            # ===== 3. Balance batch（替代pad/unpad/floor_pad） =====
+            # _balance_batch 内部会 upsample + 负载均衡
+            # upsample 复制已有样本作为padding，tag标记 is_padding=True
+            # 不再需要手动 pad → compute → unpad → floor_pad
+            batch = self._balance_batch(batch, metrics=metrics)
 
-            # after advantages are assigned, we begin to drop (1) long prompt (2) floor to ppo minisize
-            keep_indices = (~batch.batch["is_drop_mask"]).nonzero(as_tuple=True)[0]
-            metrics["training/n_triplets_prompt_too_long"] = (
-                batch.batch["is_drop_mask"].shape[0] - keep_indices.shape[0]
-            )
-            batch = batch[keep_indices]
-            # next, round to minibatch size
-            mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-            n_transition = len(batch)
-            random_indices = list(range(n_transition))
-            random.shuffle(random_indices)
-            batch.reorder(torch.tensor(random_indices).type(torch.int32))
-            n_remained_transition = n_transition // mini_batch_size * mini_batch_size
-            batch = batch[list(range(n_remained_transition))]
-            metrics["training/n_triplets_dropped_remainder"] = n_transition - n_remained_transition
+            print("padding: ", len(batch.tags))
 
-            # Agent mode note: Change the order of balance batch;
-            #     1. first calculate advantage
-            #     2. then drop the samples (too long prompt & floor to ppo minisize)
-            #     3. balance
-            # balance the number of valid tokens on each dp rank.
-            # Note that this breaks the order of data inside the batch.
-            # Please take care when you implement group based adv computation such as GRPO and rloo
-            if self.config.trainer.balance_batch:
-                self._balance_batch(batch, metrics=metrics)
+            _t_data_prep_end = _time.perf_counter()
+            timing_raw["data_prep_total"] = _t_data_prep_end - _t_data_prep_start
+
+            # ===== 4. Compute old log prob =====
+            # PPOTrainer版：内部计算entropy，直接 metrics.update({"actor/entropy": ...})
+            # 不再需要手动从返回值提取 entropy
+            with _timer("old_log_prob", timing_raw):
+                batch = self._compute_old_log_prob(batch, metrics=metrics)
+
+            # ===== 5. Compute ref log prob =====
+            if self.use_reference_policy:
+                with _timer("ref", timing_raw):
+                    batch = self._compute_ref_log_prob(batch, metrics=metrics)
+
+            # ===== 6. Compute values =====
+            if self.use_critic:
+                with _timer("values", timing_raw):
+                    batch = self._compute_values(batch, metrics=metrics)
+
+            # ===== 7. Compute advantage =====
+            # PPOTrainer版：从TQ取数据 → 计算advantage → 写回TQ
+            # 不再需要手动 token_level_rewards = token_level_scores
+            with _timer("adv", timing_raw):
+                batch = self._compute_advantage(batch, metrics=metrics)
 
             # update critic
             if self.use_critic:
                 with _timer("update_critic", timing_raw):
-                    critic_output = self.critic_wg.update_critic(batch)
-                critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-                metrics.update(critic_output_metrics)
+                    batch = self._update_critic(batch, metrics=metrics)
 
             # implement critic warmup
             if self.config.trainer.critic_warmup <= self.global_steps:
                 # update actor
                 with _timer("update_actor", timing_raw):
-                    batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                    actor_output = self.actor_rollout_wg.update_actor(batch)
-                actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                metrics.update(actor_output_metrics)
+                    batch = self._update_actor(batch, metrics=metrics)
 
-            # Log rollout generations if enabled
-            rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-            if rollout_data_dir:
-                with _timer("dump_rollout_generations", timing_raw):
-                    print(batch.batch.keys())
-                    inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
-                    outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
-                    scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
-                    self._dump_generations(
-                        inputs=inputs,
-                        outputs=outputs,
-                        scores=scores,
-                        reward_extra_infos_dict=reward_extra_infos_dict,
-                        dump_path=rollout_data_dir,
-                    )
+        return batch
 
-        # compute training metrics
-        metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic, suffix="_after_processing"))
-        metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
-        # TODO: implement actual tflpo and theoretical tflpo
-        n_gpus = self.resource_pool_manager.get_n_gpus()
-        metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
-
-        _step_t1 = _time.perf_counter()
-        _rss1 = rss_mb()
-        bench_log("main", self.global_steps, "step",
-            total_step=round(_step_t1 - _step_t0, 2),
-            gen_wake_replicas=round(_gen_wake, 2),
-            gen_set_up=round(_gen_setup, 2),
-            gen_run_until_all_finished=round(_gen_run, 2),
-            gen_get_train_data_batch=round(_gen_get, 2),
-            gen_clear=round(_gen_clear, 2),
-            gen_sleep_replicas=round(_gen_sleep, 2),
-            gen_total=round(timing_raw.get("gen", 0), 2),
-            data_prep_total=round(_t_data_prep_end - _t_data_prep_start, 4),
-            ppo_reward=round(timing_raw.get("reward", 0), 4),
-            ppo_old_log_prob=round(timing_raw.get("old_log_prob", 0), 2),
-            ppo_ref=round(timing_raw.get("ref", 0), 2),
-            ppo_values=round(timing_raw.get("values", 0), 2),
-            ppo_adv=round(timing_raw.get("adv", 0), 2),
-            ppo_update_critic=round(timing_raw.get("update_critic", 0), 2),
-            ppo_update_actor=round(timing_raw.get("update_actor", 0), 2),
-            n_triplets=metrics.get("training/n_triplets", 0),
-            rss_mb=round(max(_rss0, _rss1), 1),
-        )
-
-        return metrics
+    def _cleanup(self):
+        if hasattr(self, 'replay_buffer'):
+            self.replay_buffer.close()
+        self._shutdown_dump_executor()
 
     def fit(self):
+        if self._dump_executor._shutdown:
+            self._init_dump_executor()
+            
         logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -487,23 +434,15 @@ class AgentLightningTrainer(RayPPOTrainer):
             config=OmegaConf.to_container(self.config, resolve=True),
         )
 
-        self.global_steps = 0
-
         # load checkpoint before doing anything
         self._load_checkpoint()
+        self.checkpoint_manager.update_weights()
 
-        assert self.async_rollout_mode, "If agent mode is enabled, async server must be enabled"
         if self.adapter is not None and not isinstance(self.adapter, TraceToTripletBase):
             raise ValueError("Adapter must be a TraceToTripletBase for currently VERL implementation.")
-        verl_version = verl.__version__
-        if verl_version == "0.5.0":
-            # Note (Zhiyuan): To avoid further patch into vllm async server, using the same sentence to get the naming here.
-            # However, it is possible that verl updates the naming and causes incompatibility.
-            # Reference: https://github.com/volcengine/verl/blob/5b5e09d9cc20625e436d01f69d9cc739ff681c54/verl/workers/rollout/vllm_rollout/vllm_async_server.py#L217
-            model = "/".join(self.config.actor_rollout_ref.model.path.split("/")[-2:])
-        else:
-            # For other versions (e.g., 0.6.0), we use the full path to the model.
-            model = self.config.actor_rollout_ref.model.path
+        
+        model = self.config.actor_rollout_ref.model.path
+        
         self.agent_mode_daemon = self.daemon_cls(
             self.config.agentlightning.port,
             self.config.actor_rollout_ref.rollout.n,
@@ -521,82 +460,112 @@ class AgentLightningTrainer(RayPPOTrainer):
             processor=self.processor,  # For Qwen2-VL mrope position_ids
             image_base_dir=getattr(self.config.data, "image_base_dir", None),
             trace_aggregator=self.config.agentlightning.trace_aggregator,
+            max_prompt_length=self.config.data.max_prompt_length,
+            max_response_length=self.config.data.max_response_length,
         )
         self.agent_mode_daemon.start()
 
-        # perform validation before training
-        # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
-            val_metrics = self._validate()
-            assert val_metrics, f"{val_metrics=}"
-            pprint(f"Initial validation metrics: {val_metrics}")
-            logger.log(data=val_metrics, step=self.global_steps)
-            if self.config.trainer.get("val_only", False):
-                return
+        from verl.trainer.main_ppo_sync import ReplayBuffer
+        self.replay_buffer = ReplayBuffer(poll_interval=3.0)
 
-        # add tqdm
-        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+        try:
+            # 清理 TQ 残留数据（上次崩溃可能遗留 running barrier 等）
+            import transfer_queue as tq
+            all_data = tq.kv_list()
+            if all_data:
+                for partition_id, items in all_data.items():
+                    if items:
+                        tq.kv_clear(keys=list(items.keys()), partition_id=partition_id)
+                print(f"[TQ4-DEBUG] Cleared residual TQ data before training")
+            else:
+                print(f"[TQ4-DEBUG] TQ is clean before training")
 
-        # we start from step 1
-        self.global_steps += 1
-        last_val_metrics = None
-
-        for epoch in range(self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
-                metrics = {}
-                timing_raw = {}
-                is_last_step = self.global_steps >= self.total_training_steps
-
-                # train step
-                metrics = self._train_step(batch_dict)
-
-                # validate
-                if (
-                    self.val_reward_fn is not None
-                    and self.config.trainer.test_freq > 0
-                    and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
-                ):
-                    with _timer("validate", timing_raw):
-                        val_metrics: dict = self._validate()
-                        if is_last_step:
-                            last_val_metrics = val_metrics
-                    metrics.update(val_metrics)
-
-                if self.config.trainer.save_freq > 0 and (
-                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0
-                ):
-                    with _timer("save_checkpoint", timing_raw):
-                        self._save_checkpoint()
-
-                # update weights
-                _uw_t0 = now()
-                self.async_rollout_manager.wake_up()
-                if hasattr(self, 'actor_rollout_wg') and self.actor_rollout_wg is not None:
-                    self.actor_rollout_wg.update_policy.remote() if hasattr(self.actor_rollout_wg, 'update_policy') else None
-                _uw_t1 = now()
-                bench_log("main", self.global_steps, "update_weights",
-                    update_weights=round(_uw_t1 - _uw_t0, 2))
-
-                # step metrics
-                metrics.update(
-                    {
-                        "training/global_step": self.global_steps,
-                        "training/epoch": epoch,
-                    }
-                )
-
-                # TODO: make a canonical logger that supports various backend
-                logger.log(data=metrics, step=self.global_steps)
-
-                if is_last_step:
-                    pprint(f"Final validation metrics: {last_val_metrics}")
-                    progress_bar.close()
-
-                    # This exit logic is to ensure a robust CI.
-                    pprint(f"Flush the logger...")
-                    del logger  # Make sure the loggers are flushed and closed properly
-                    pprint(f"Training finished at step {self.global_steps}.")
+            if self.config.trainer.get("val_before_train", True):
+                val_metrics = self._validate()
+                assert val_metrics, f"{val_metrics=}"
+                pprint(f"Initial validation metrics: {val_metrics}")
+                logger.log(data=val_metrics, step=self.global_steps)
+                if self.config.trainer.get("val_only", False):
                     return
 
-                progress_bar.update(1)
-                self.global_steps += 1
+            # add tqdm
+            progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+
+            # we start from step 1
+            self.global_steps += 1
+            last_val_metrics = None
+
+            for epoch in range(self.config.trainer.total_epochs):
+                for batch_dict in self.train_dataloader:
+                    metrics, timing_raw = {}, {}
+
+                    is_last_step = self.global_steps >= self.total_training_steps
+
+                    # train step
+                    import time as _time
+                    _step_t0 = _time.time()
+                    batch = self._train_step(batch_dict, metrics, timing_raw)
+                    _step_t1 = _time.time()
+                    _msg = f"[BENCH-STORE-REWARD] step={self.global_steps} total_train_step={_step_t1-_step_t0:.2f}s, timing={timing_raw}"
+                    print(_msg)
+                    with open("/home/ma-user/install/bench_store_reward.txt", "a") as _f:
+                        _f.write(_msg + "\n")
+                    bench_log("store_reward", self.global_steps, "step",
+                        total_train_step=_step_t1-_step_t0, timing=timing_raw,
+                        data_prep_total=round(timing_raw.pop("data_prep_total", 0), 4),
+                        rss_mb=rss_mb())
+
+                    # save checkpoint
+                    if self.config.trainer.save_freq > 0 and (
+                        is_last_step or self.global_steps % self.config.trainer.save_freq == 0
+                    ):
+                        with _timer("save_checkpoint", timing_raw):
+                            self._save_checkpoint()
+
+                    # update weights from trainer to rollout
+                    with _timer("update_weights", timing_raw):
+                        _uw_t0 = _time.time()
+                        self.checkpoint_manager.update_weights()
+                        _uw_t1 = _time.time()
+                        _msg = f"[BENCH-STORE-REWARD] step={self.global_steps} update_weights={_uw_t1-_uw_t0:.2f}s"
+                        print(_msg)
+                        with open("/home/ma-user/install/bench_store_reward.txt", "a") as _f:
+                            _f.write(_msg + "\n")
+                        bench_log("store_reward", self.global_steps, "update_weights",
+                            uw_total=_uw_t1-_uw_t0, rss_mb=rss_mb())
+
+                    # validate
+                    if self.config.trainer.test_freq > 0 and (
+                        is_last_step or self.global_steps % self.config.trainer.test_freq == 0
+                    ):
+                        with _timer("testing", timing_raw):
+                            val_metrics: dict = self._validate()
+                            if is_last_step:
+                                last_val_metrics = val_metrics
+                        metrics.update(val_metrics)
+
+                    # record metrics
+                    self._compute_metrics(batch, metrics, timing_raw, global_steps=self.global_steps, epoch=epoch)
+
+                    # Log rollout generations if enabled
+                    rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                    if rollout_data_dir:
+                        with _timer("dump_rollout_generations", timing_raw):
+                            self._log_rollout_data(batch, timing_raw, rollout_data_dir)
+                
+                    # cleanup transfer queue and replay buffer
+                    tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
+
+                    # TODO: make a canonical logger that supports various backend
+                    logger.log(data=metrics, step=self.global_steps)
+                    progress_bar.update(1)
+                    self.global_steps += 1
+                    if is_last_step:
+                        pprint(f"Final validation metrics: {last_val_metrics}")
+                        progress_bar.close()
+                        pprint(f"Flush the logger...")
+                        del logger
+                        pprint(f"Training finished at step {self.global_steps}.")
+                        return
+        finally:
+            self._cleanup()

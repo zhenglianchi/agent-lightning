@@ -10,6 +10,7 @@ agentlightning:
   port: 9999
   trace_aggregator:
     level: transition  # transition or trajectory, docs refer to https://agent-lightning.github.io/posts/trajectory_level_aggregation/
+    #level: trajectory
     trajectory_max_prompt_length: 2048  # supported in trajectory level aggregation, suggest to set as maximum length for the prompt in first turn
     trajectory_max_response_length: 8192  # supported in trajectory level aggregation, suggest to set as maximum length for the cumulative agent responses in the full trajectory, i.e., n_turns * (max_response_length + max_prompt_length)
     debug: False  # supported in trajectory level aggregation, enable to diagnose trace merging failures
@@ -25,4 +26,11 @@ actor_rollout_ref:
     agent:
       custom_async_server:
         path: pkg://agentlightning.verl.async_server
+        # 这里其实在verl里面是写死的，所以这个配置并没有起作用
+        # verl-0.8.0/verl/workers/rollout/vllm_rollout/vllm_async_server.py中写死了self.server_class = ray.remote(vLLMHttpServer)
         name: PatchedvLLMServer
+
+
+# 通过 model_engine 选择引擎，不需要手动设 actor.strategy
+# model_engine: dp  # 默认，等价于 fsdp
+# 命令行覆盖: python -m agentlightning.verl model_engine=megatron

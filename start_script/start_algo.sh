@@ -1,0 +1,2 @@
+export VLLM_ASCEND_ENABLE_NZ=0
+python start_algorithm.py

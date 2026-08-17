@@ -1,0 +1,33 @@
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index d4194e1c..34bb2658 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -81,6 +81,7 @@ logger = logging.getLogger(__file__)
+ logger.setLevel(logging.INFO)
+ 
+ 
++@ray.remote(num_cpus=1)
+ class vLLMHttpServer:
+     """vLLM http server in single node, this is equivalent to launch server with command line:
+     ```
+@@ -963,7 +964,7 @@ class vLLMReplica(RolloutReplica):
+         super().__init__(
+             replica_rank, config, model_config, gpus_per_node, is_reward_model, is_teacher_model, name_suffix
+         )
+-        self.server_class = ray.remote(vLLMHttpServer)
++        self.server_class = vLLMHttpServer
+ 
+     async def launch_servers(self):
+         """Launch http server in each node."""
+@@ -1017,9 +1018,9 @@ class vLLMReplica(RolloutReplica):
+                     node_id=node_id,
+                     soft=False,
+                 ),
+-                runtime_env={"env_vars": env_vars},
++                #runtime_env={"env_vars": env_vars},
+                 name=name,
+-                max_concurrency=self.max_concurrency,
++                #max_concurrency=self.max_concurrency,
+             ).remote(
+                 config=self.config,
+                 model_config=self.model_config,

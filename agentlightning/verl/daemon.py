@@ -18,13 +18,16 @@ import torch
 from flask import Flask, Response, abort, request
 from tensordict import TensorDict
 from verl import DataProto
+from verl.utils.tensordict_utils import list_of_dict_to_tensordict
+import transfer_queue as tq
+from transfer_queue import KVBatchMeta
 
 from agentlightning import LLM, AgentLightningServer, NamedResources, RolloutLegacy
 from agentlightning.adapter.triplet import TracerTraceToTriplet, TraceToTripletBase
 from agentlightning.llm_proxy import LLMProxy, ModelConfig
 from agentlightning.store.base import LightningStore
 from agentlightning.types import EnqueueRolloutRequest, Rollout, RolloutConfig, Task
-from agentlightning.bench_detail import bench_log, now
+from agentlightning.bench_detail import bench_log, now, rss_mb
 
 __all__ = [
     "AgentModeDaemon",
@@ -228,6 +231,8 @@ class AgentModeDaemon:
         processor: Any = None,
         image_base_dir: Optional[str] = None,
         trace_aggregator: Dict[str, Any] = {"level": "transition"},
+        max_prompt_length: Optional[int] = None,
+        max_response_length: Optional[int] = None,
     ):
         self.mode = mode
         self.llm_timeout_seconds = llm_timeout_seconds
@@ -244,19 +249,19 @@ class AgentModeDaemon:
             assert store is not None
             self.store = store
             if llm_proxy is None:
+                resolved_adapter = adapter if adapter is not None else TracerTraceToTriplet()
                 self.llm_proxy = LLMProxy(
                     port=_find_available_port(),
                     model_list=[],
                     store=store,
+                    adapter=resolved_adapter,
+                    max_prompt_length=max_prompt_length,
+                    max_response_length=max_response_length,
                 )
             else:
                 # Reuse the existing LLM proxy (probably configured by user)
                 self.llm_proxy = llm_proxy
-            if adapter is None:
-                self.adapter = TracerTraceToTriplet()
-            else:
-                # Reuse the one from trainer
-                self.adapter = adapter
+            self.adapter = resolved_adapter if llm_proxy is None else (adapter if adapter is not None else TracerTraceToTriplet())
             self._internal_loop: Optional[asyncio.AbstractEventLoop] = None
             self._internal_loop_thread = threading.Thread(target=self._internal_loop_runner, daemon=True)
             self._internal_loop_thread.start()
@@ -271,6 +276,8 @@ class AgentModeDaemon:
         self.reward_fillna_value = reward_fillna_value
         self.image_base_dir = image_base_dir
         self.trace_aggregator = trace_aggregator
+        self._max_prompt_length = max_prompt_length
+        self._max_response_length = max_response_length
 
         # Check if model requires multimodal position_ids (e.g., Qwen2-VL)
         self._use_mrope = self._is_mrope_model()
@@ -501,12 +508,14 @@ class AgentModeDaemon:
             # Start proxy server in _async_set_up
             pass
 
-    async def _async_set_up(self, data: Dict[str, Any], server_addresses: List[str], is_train: bool = True):
+    async def _async_set_up(self, data: Dict[str, Any], server_addresses: List[str], is_train: bool = True, global_steps=None):
         """Async helper to set up data and resources on the server."""
+        print(f"[TQ6B-ALGO] _async_set_up ENTER: is_train={is_train}, global_steps={global_steps}, num_samples={len(data.get(list(data.keys())[0], [])) if data else 0}", flush=True)
         self.clear_data_and_server()
         if server_addresses != self.backend_llm_server_addresses:
             self.backend_llm_server_addresses = server_addresses
             if self.mode == "v1" and not self.llm_proxy.is_running():
+                print(f"[TQ6B-ALGO] _async_set_up: starting proxy server v1", flush=True)
                 await self._update_proxy_server_v1()
         self.is_train = is_train
 
@@ -554,6 +563,12 @@ class AgentModeDaemon:
             # Data ID is different from Rollout ID, as one data can have multiple rollouts.
             for _ in range(rollouts_per_sample):
                 task_metadata = {"data_id": data_id, "is_train": is_train}
+                if global_steps is not None:
+                    task_metadata["global_steps"] = global_steps
+                if self._max_prompt_length is not None:
+                    task_metadata["max_prompt_length"] = self._max_prompt_length
+                if self._max_response_length is not None:
+                    task_metadata["max_response_length"] = self._max_response_length
                 if self.mode == "v0":
                     # Queue immediately
                     rollout_id = await self.server.queue_task(
@@ -583,7 +598,9 @@ class AgentModeDaemon:
 
         if self.mode == "v1":
             # Enqueue all the tasks in a single batch
+            print(f"[TQ6B-ALGO] _async_set_up: enqueuing {len(enqueue_rollout_requests)} rollouts", flush=True)
             rollouts = await self.store.enqueue_many_rollouts(enqueue_rollout_requests)
+            print(f"[TQ6B-ALGO] _async_set_up: enqueued {len(rollouts)} rollouts", flush=True)
             self._task_id_to_original_sample.update(
                 {
                     # Recover the original data and store it for later use.
@@ -593,11 +610,20 @@ class AgentModeDaemon:
             )
             self._total_tasks_queued += len(rollouts)
 
-    def set_up_data_and_server(self, data: Dict[str, Any], server_addresses: List[str], is_train: bool = True):
+        if global_steps is not None and is_train:
+            import transfer_queue as tq
+            print(f"[TQ6B-ALGO] _async_set_up: writing running barriers for {len(self._task_id_to_original_sample)} rollouts, global_steps={global_steps}", flush=True)
+            for rollout_id in self._task_id_to_original_sample:
+                tq.kv_put(
+                    key=rollout_id,
+                    partition_id="train",
+                    tag={"global_steps": global_steps, "status": "running"},
+                )
+            print(f"[TQ6B-ALGO] _async_set_up: running barriers written for {len(self._task_id_to_original_sample)} rollouts", flush=True)
+
+    def set_up_data_and_server(self, data: Dict[str, Any], server_addresses: List[str], is_train: bool = True, global_steps: int = None):
         """Synchronous wrapper for setting up data and server resources."""
-        self._bench_query_total = 0.0
-        self._bench_adapt_total = 0.0
-        coro = self._async_set_up(data, server_addresses, is_train)
+        coro = self._async_set_up(data, server_addresses, is_train, global_steps=global_steps)
 
         if self.mode == "v0":
             if not self.server.loop or not self.server.startup_event.is_set():
@@ -686,6 +712,8 @@ class AgentModeDaemon:
 
     async def _async_run_until_finished(self, verbose: bool = True):
         """Async helper to wait for all tasks to complete."""
+        import time as _time
+        _wait_start = _time.time()
         while len(self._completed_rollouts_v0) < self._total_tasks_queued:
             if self.mode == "v0":
                 completed_batch = await self.server.retrieve_completed_rollouts()
@@ -706,10 +734,10 @@ class AgentModeDaemon:
                 else:
                     self._completed_rollouts_v0[rollout.rollout_id] = rollout
             if verbose:
-                print(f"Completed {len(self._completed_rollouts_v0)}/{self._total_tasks_queued} tasks...")
+                print(f"[TQ4-DEBUG] daemon: Completed {len(self._completed_rollouts_v0)}/{self._total_tasks_queued} tasks... (elapsed={_time.time()-_wait_start:.1f}s)")
             await asyncio.sleep(5)
 
-        print("All tasks finished.")
+        print(f"[TQ4-DEBUG] daemon: All tasks finished. (elapsed={_time.time()-_wait_start:.1f}s)")
 
     def run_until_all_finished(self, verbose: bool = True):
         """Synchronously waits for all queued tasks to be completed and reported."""
@@ -819,7 +847,7 @@ class AgentModeDaemon:
         return metric_dict
 
     def get_train_data_batch(
-        self, max_prompt_length: int, max_response_length: int, device: torch.device, global_steps: int
+        self, max_prompt_length: int, max_response_length: int, device: torch.device, global_steps: int, partition_id: str = "train"
     ):
         """
         Processes completed rollouts to generate a training data batch.
@@ -874,17 +902,19 @@ class AgentModeDaemon:
         #     discarded here. They are only truncated and marked, to be discarded later.
         #     This is for the correctness of the advantage calculation.
         #   - The discard for the PPO mini-batch should also be handled this way.
-        input_ids_list: List[List[int]] = []
-        input_attention_mask_list: List[List[int]] = []
-        response_ids_list: List[List[int]] = []
-        response_attention_mask_list: List[List[int]] = []
+        # TQ写入：直接构建unpadded变长tensor，无需先pad再unpad
+        # 逐样本收集原始数据，跳过padding步骤
         reward_list: List[float] = []
         data_id_list: List[str] = []
         rollout_id_list: List[str] = []
         turn_index_list: List[int] = []
         is_drop_list: List[bool] = []
-        image_grid_thw_list: List[Optional[torch.Tensor]] = []  # For Qwen2-VL mrope
+        image_grid_thw_list: List[Optional[torch.Tensor]] = []
         n_trunc_sample_because_of_response = 0
+        # 逐样本的unpadded原始数据，用于构建TQ的NestedTensor
+        raw_prompt_ids_list: List[List[int]] = []
+        raw_response_ids_list: List[List[int]] = []
+        raw_response_mask_list: List[List[int]] = []
 
         if self.trace_aggregator.get("level", "transition") == "transition":
             for rollout_id, sample_info in finished_id_to_sample_info.items():
@@ -893,35 +923,23 @@ class AgentModeDaemon:
                     reward_list.append(sample_info["reward"])
                     prompt_ids, response_ids = trace["prompt_ids"], trace["response_ids"]
 
-                    # Mark samples with prompts exceeding max_prompt_length to be dropped later
                     if len(prompt_ids) > max_prompt_length:
                         prompt_ids = prompt_ids[:max_prompt_length]
                         is_drop_list.append(True)
                     else:
                         is_drop_list.append(False)
 
-                    # Truncate responses that exceed max_response_length
                     if len(response_ids) > max_response_length:
                         response_ids = response_ids[:max_response_length]
                         n_trunc_sample_because_of_response += 1
 
-                    # Pad prompts to the left and responses to the right
-                    one_input_ids, one_input_attention_mask = get_left_padded_ids_and_attention_mask(
-                        prompt_ids, max_prompt_length, self.pad_token_id
-                    )
-                    one_response_ids, one_response_attention_mask = get_right_padded_ids_and_attention_mask(
-                        response_ids, max_response_length, self.pad_token_id
-                    )
-
-                    input_ids_list.append(one_input_ids)
-                    input_attention_mask_list.append(one_input_attention_mask)
-                    response_ids_list.append(one_response_ids)
-                    response_attention_mask_list.append(one_response_attention_mask)
+                    # 不再pad，直接保存原始变长数据
+                    raw_prompt_ids_list.append(prompt_ids)
+                    raw_response_ids_list.append(response_ids)
                     data_id_list.append(sample_info["data_id"])
                     rollout_id_list.append(rollout_id)
                     turn_index_list.append(turn_index)
 
-                    # Compute image_grid_thw for this triplet using image_urls from prompt
                     if self._use_mrope:
                         image_urls = trace.get("image_urls", [])
                         image_grid_thw_list.append(self._get_image_grid_thw(image_urls))
@@ -929,7 +947,6 @@ class AgentModeDaemon:
         elif self.trace_aggregator.get("level", "transition") == "trajectory":
             assert not self._use_mrope, "M-RoPE is not supported in trajectory level yet."
 
-            response_mask_list: List[List[int]] = []
             unmerged_count: int = 0
             template_mismatch_count, retoken_mismatch_count, others_mismatch_count = 0, 0, 0
             response_per_turn_list: List[int] = []
@@ -937,7 +954,6 @@ class AgentModeDaemon:
             for rollout_id, sample_info in finished_id_to_sample_info.items():
                 merged_trace_idx: List[List[int]] = []
 
-                # Identify which turns can be merged based on token ids prefix matching
                 current_merged_trace_idx: List[int] = []
                 current_context: List[int] = []
                 for turn_index, trace in enumerate(sample_info["trace_list"]):
@@ -976,11 +992,9 @@ class AgentModeDaemon:
                 if len(merged_trace_idx) > 1:
                     unmerged_count += 1
 
-                # Merge all trace segments in merged_trace_idx into training samples
                 for current_merged_trace_idx in merged_trace_idx:
                     prompt_ids = sample_info["trace_list"][current_merged_trace_idx[0]]["prompt_ids"]
 
-                    # if the merged_trace_idx doesn't start with the beginning of the prompt_ids, we need to adjust it
                     if current_merged_trace_idx[0] > 0 and len(prompt_ids) > max_prompt_length:
                         response_ids = prompt_ids[max_prompt_length:]
                         prompt_ids = prompt_ids[:max_prompt_length]
@@ -990,8 +1004,9 @@ class AgentModeDaemon:
                         response_mask = []
 
                     prompt_length = len(prompt_ids)
-                    response_ids += sample_info["trace_list"][current_merged_trace_idx[0]]["response_ids"]
-                    response_mask += [1] * len(response_ids)
+                    first_turn_response = sample_info["trace_list"][current_merged_trace_idx[0]]["response_ids"]
+                    response_ids += first_turn_response
+                    response_mask += [1] * len(first_turn_response)
                     for turn_index in current_merged_trace_idx[1:]:
                         trace = sample_info["trace_list"][turn_index]
                         new_prompt_length = len(trace["prompt_ids"]) - len(response_ids) - prompt_length
@@ -1002,127 +1017,114 @@ class AgentModeDaemon:
 
                     reward_list.append(sample_info["reward"])
 
-                    # Mark samples with prompts exceeding max_prompt_length to be dropped later
                     if len(prompt_ids) > max_prompt_length:
                         prompt_ids = prompt_ids[:max_prompt_length]
                         is_drop_list.append(True)
                     else:
                         is_drop_list.append(False)
 
-                    # Truncate responses that exceed max_response_length
                     if len(response_ids) > max_response_length:
                         response_ids = response_ids[:max_response_length]
                         response_mask = response_mask[:max_response_length]
                         n_trunc_sample_because_of_response += 1
 
-                    # Pad prompts to the left and responses to the right
-                    one_input_ids, one_input_attention_mask = get_left_padded_ids_and_attention_mask(
-                        prompt_ids, max_prompt_length, self.pad_token_id
-                    )
-                    one_response_ids, one_response_attention_mask = get_right_padded_ids_and_attention_mask(
-                        response_ids, max_response_length, self.pad_token_id
-                    )
-                    one_response_mask, _ = get_right_padded_ids_and_attention_mask(
-                        response_mask, max_response_length, 0
-                    )
-
-                    input_ids_list.append(one_input_ids)
-                    input_attention_mask_list.append(one_input_attention_mask)
-                    response_ids_list.append(one_response_ids)
-                    response_attention_mask_list.append(one_response_attention_mask)
-                    response_mask_list.append(one_response_mask)
+                    # 不再pad，直接保存原始变长数据
+                    raw_prompt_ids_list.append(prompt_ids)
+                    raw_response_ids_list.append(response_ids)
+                    raw_response_mask_list.append(response_mask)
                     data_id_list.append(sample_info["data_id"])
                     rollout_id_list.append(rollout_id)
-                    # turn_index_list.append(current_merged_trace_idx)
         else:
             raise ValueError(f"Unknown trace_aggregator level: {self.trace_aggregator.get('level')}")
 
-        n_transition = len(input_ids_list)
-        _t_build = now()
-        batch_input_ids = torch.LongTensor(input_ids_list).to(device)
-        input_attention_mask = torch.LongTensor(input_attention_mask_list).to(device)
-        batch_response_ids = torch.LongTensor(response_ids_list).to(device)
-        response_attention_mask = torch.LongTensor(response_attention_mask_list).to(device)
-        response_mask = (
-            torch.LongTensor(response_mask_list).to(device) if self.trace_aggregator.get("level", "transition") == "trajectory" else None  # type: ignore
-        )
+        n_transition = len(raw_prompt_ids_list)
 
-        # Concatenate prompts and responses to form the full sequence
-        batch_seq = torch.cat([batch_input_ids, batch_response_ids], dim=-1)
-        attention_mask = torch.cat([input_attention_mask, response_attention_mask], dim=-1)
+        # 逐样本构建unpadded变长tensor，写入TQ时使用NestedTensor格式
+        # PPOTrainer._compute_metrics中data["prompts"].offsets().diff()依赖NestedTensor获取真实长度
+        fields_list = []
+        for i in range(n_transition):
+            prompt_ids = raw_prompt_ids_list[i]
+            response_ids = raw_response_ids_list[i]
+            seq_ids = prompt_ids + response_ids
+            prompt_len = len(prompt_ids)
+            response_len = len(response_ids)
+            seq_len = prompt_len + response_len
 
-        # Compute position_ids - use mrope for Qwen2-VL, standard 2D otherwise
-        if self._use_mrope:
-            # For Qwen2-VL: compute 4D position_ids (batch_size, 4, seq_length)
-            position_ids_list: list[torch.Tensor] = []
-            for i in range(n_transition):
-                pos_ids = self._compute_mrope_position_ids(
-                    input_ids=batch_seq[i],
-                    attention_mask=attention_mask[i],
-                    image_grid_thw=image_grid_thw_list[i] if image_grid_thw_list else None,
-                )  # (4, seq_length)
-                position_ids_list.append(pos_ids)
-            # Stack to (batch_size, 4, seq_length)
-            position_ids = torch.stack(position_ids_list, dim=0)
-        else:
-            # Standard 2D position_ids (batch_size, seq_length)
-            position_ids = torch.clamp(torch.cumsum(attention_mask, dim=-1) - 1, min=0)
+            # token_level_scores: reward放在response最后一个token位置
+            token_level_scores_i = [0.0] * response_len
+            token_level_scores_i[-1] = reward_list[i]
+            token_level_scores_tensor = torch.tensor(token_level_scores_i, dtype=torch.float32).to(device)
 
-        is_drop_mask = torch.BoolTensor(is_drop_list).to(device)
-        scores = torch.tensor(reward_list, dtype=torch.bfloat16).to(device)
+            # position_ids: unpadded序列全为真实token，等价于cumsum(all-1 mask) - 1
+            position_ids_i = torch.arange(seq_len, dtype=torch.long).to(device)
 
-        # Create token-level scores by placing the final reward at the last token position
-        token_level_scores = torch.zeros_like(attention_mask, dtype=scores.dtype)
-        # For mrope (3D position_ids), use the first dimension (text position_ids) for eos calculation
-        if self._use_mrope:
-            # position_ids is (batch_size, 4, seq_length), use first dim for text positions
-            text_position_ids = position_ids[:, 0, :]  # (batch_size, seq_length)
-            eos_mask_idx = torch.argmax(text_position_ids * attention_mask, dim=-1)  # (bsz,)
-        else:
-            eos_mask_idx = torch.argmax(position_ids * attention_mask, dim=-1)  # (bsz,)
-        # At the eos_mask_idx position of each sample, fill in the corresponding scores.
-        # torch.arange(n_transition) generates [0,1,2,...,bsz-1] as indices for the batch dimension.
-        token_level_scores[torch.arange(n_transition), eos_mask_idx] = scores
-        # Only take the last response_length part of the sequence to get the token-level scores for the model's response part.
-        token_level_scores = token_level_scores[:, -max_response_length:]
+            # mrope需要特殊处理position_ids
+            if self._use_mrope:
+                input_ids_tensor = torch.tensor([seq_ids], dtype=torch.long).to(device)
+                attention_mask_tensor = torch.ones(1, seq_len, dtype=torch.long).to(device)
+                image_grid_thw = image_grid_thw_list[i] if image_grid_thw_list else None
+                position_ids_i = self._compute_mrope_position_ids(
+                    input_ids=input_ids_tensor[0],
+                    attention_mask=attention_mask_tensor[0],
+                    image_grid_thw=image_grid_thw,
+                )
 
-        # Form the final batch using TensorDict
-        batch = TensorDict(
-            {
-                "prompts": batch_input_ids,
-                "responses": batch_response_ids,
-                "input_ids": batch_seq,  # here input_ids become the whole sentences
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-                "is_drop_mask": is_drop_mask,
-                "token_level_scores": token_level_scores.contiguous(),
-                **(
-                    {"response_mask": response_mask}
-                    if self.trace_aggregator.get("level", "transition") == "trajectory"
-                    else {}
-                ),
-            },  # type: ignore
-            batch_size=n_transition,
-        )
-        data_proto = DataProto(batch=batch)
-        _t_build_end = now()
+            field = {
+                "prompts": torch.tensor(prompt_ids, dtype=torch.long).to(device),
+                "responses": torch.tensor(response_ids, dtype=torch.long).to(device),
+                "input_ids": torch.tensor(seq_ids, dtype=torch.long).to(device),
+                "attention_mask": torch.ones(seq_len, dtype=torch.long).to(device),
+                "position_ids": position_ids_i,
+                "token_level_scores": token_level_scores_tensor,
+                "uid": data_id_list[i],
+                "rm_scores": token_level_scores_tensor,
+                "num_turns": 1,
+            }
 
-        _seq_lens = [int(am.sum().item()) for am in attention_mask]
-        _padded_bytes = int(attention_mask.numel() * attention_mask.element_size())
-        _unpadded_bytes = int(sum(_seq_lens) * attention_mask.element_size())
-        _padding_ratio = (_padded_bytes - _unpadded_bytes) / max(_padded_bytes, 1)
+            # response_mask/loss_mask：trajectory模式从trace生成，transition模式全1
+            if self.trace_aggregator.get("level") == "trajectory":
+                field["response_mask"] = torch.tensor(raw_response_mask_list[i], dtype=torch.long).to(device)
+                field["loss_mask"] = torch.tensor(raw_response_mask_list[i], dtype=torch.long).to(device)
+            else:
+                field["response_mask"] = torch.ones(response_len, dtype=torch.long).to(device)
+                field["loss_mask"] = torch.ones(response_len, dtype=torch.long).to(device)
 
-        bench_log("main", global_steps, "data_transfer",
-            query_spans_total=round(self._bench_query_total, 4),
-            adapt_total=round(self._bench_adapt_total, 4),
-            build_dataproto=round(_t_build_end - _t_build, 4),
+            fields_list.append(field)
+
+        # list_of_dict_to_tensordict: 变长tensor→NestedTensor(jagged), 非tensor→NonTensorStack
+        fields = list_of_dict_to_tensordict(fields_list)
+
+        # 生成唯一key：{data_id}_{rollout_id}_{turn_index}
+        keys = []
+        tags = []
+        for i in range(n_transition):
+            if self.trace_aggregator.get("level") == "transition":
+                key = f"{data_id_list[i]}_{rollout_id_list[i]}_{turn_index_list[i]}"
+            else:
+                key = f"{data_id_list[i]}_{rollout_id_list[i]}_{i}"
+            keys.append(key)
+            prompt_len = len(raw_prompt_ids_list[i])
+            response_len = len(raw_response_ids_list[i])
+            tags.append({"seq_len": prompt_len + response_len, "is_drop": is_drop_list[i]})
+
+        _t_tq_write = now()
+        tq.kv_batch_put(keys=keys, partition_id=partition_id, fields=fields, tags=tags)
+        _t_tq_write_end = now()
+        _seq_lens = [t.get("seq_len", 0) for t in tags]
+        bench_log("store_reward", global_steps, "daemon_tq_write",
+            daemon_tq_write=round(_t_tq_write_end - _t_tq_write, 4),
             n_triplets=n_transition,
-            padded_bytes=_padded_bytes,
-            unpadded_bytes=_unpadded_bytes,
-            padding_ratio=round(_padding_ratio, 4),
+            unpadded_bytes=sum(sl * 8 for sl in _seq_lens),
             avg_seq_len=round(float(np.mean(_seq_lens)), 1) if _seq_lens else 0,
             max_seq_len=max(_seq_lens) if _seq_lens else 0,
             min_seq_len=min(_seq_lens) if _seq_lens else 0,
+            rss_mb=rss_mb())
+
+        batch_meta = KVBatchMeta(
+            keys=keys,
+            tags=tags,
+            partition_id=partition_id,
+            fields=set(fields.keys()),
         )
 
         data_metrics = {
@@ -1132,7 +1134,6 @@ class AgentModeDaemon:
             "training/n_rollouts_w_reward": sample_with_reward_count,
             "training/n_truncated_triplets": n_trunc_sample_because_of_response,
             "training/n_triplets": n_transition,
-            # log data, only for debug testing
             **(
                 {
                     "training/n_unmerged_rollouts": unmerged_count,  # type: ignore
@@ -1159,16 +1160,11 @@ class AgentModeDaemon:
             ),
         }
 
-        # Add non-tensor data for advantage calculation and logging
-        data_proto.non_tensor_batch["data_id_list"] = np.array(data_id_list)  # type: ignore
-        data_proto.non_tensor_batch["rollout_id_list"] = np.array(rollout_id_list)  # type: ignore
-        if self.trace_aggregator.get("level", "transition") == "transition":
-            data_proto.non_tensor_batch["turn_index_list"] = np.array(turn_index_list)  # type: ignore
-
-        return data_proto, data_metrics
+        return batch_meta, data_metrics
 
     def clear_data_and_server(self):
         """Resets the internal state of the daemon for the next run."""
+        print(f"[TQ6B-ALGO] clear_data_and_server: clearing state, queued={self._total_tasks_queued}", flush=True)
         self.backend_llm_server_addresses = []
         self._completed_rollouts_v0.clear()
         self._task_id_to_original_sample.clear()

@@ -6,12 +6,13 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any, Type
 
 import hydra
 import ray
 from ray.actor import ActorClass
-from verl.trainer.main_ppo import create_rl_sampler
+from verl.trainer.main_ppo_sync import create_rl_sampler
 from verl.trainer.ppo.reward import load_reward_manager
 
 from agentlightning.adapter import TraceAdapter
@@ -59,20 +60,29 @@ def run_ppo(
     trainer_cls: Type[AgentLightningTrainer],
     daemon_cls: Type[AgentModeDaemon],
 ) -> None:
-    if not ray.is_initialized():
-        # this is for local ray cluster
-        try:
-            # verl >= 0.6.0
-            num_cpus = config.ray_kwargs.ray_init.num_cpus
-        except AttributeError:
-            # verl < 0.6.0
-            num_cpus = config.ray_init.num_cpus
-        ray.init(
-            runtime_env={
-                "env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN"}
-            },
-            num_cpus=num_cpus,
-        )
+    # Always re-init to ensure correct namespace for TQ sharing
+    if ray.is_initialized():
+        ray.shutdown()
+    try:
+        # verl >= 0.6.0
+        num_cpus = config.ray_kwargs.ray_init.num_cpus
+    except AttributeError:
+        # verl < 0.6.0
+        num_cpus = config.ray_init.num_cpus
+
+    ray.init(
+        address=os.environ.get("RAY_ADDRESS", "auto"),
+        namespace=os.environ.get("RAY_NAMESPACE", "transfer_queue"),
+        runtime_env={
+            "env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN"}
+        },
+        num_cpus=num_cpus,
+    )
+    print(
+        f"[TQ6B-DEBUG] entrypoint.py ray.init: namespace={ray.get_runtime_context().namespace}, "
+        f"address={os.environ.get('RAY_ADDRESS', 'auto')}",
+        flush=True,
+    )
 
     runner = TaskRunner.remote()
     ray.get(
@@ -106,142 +116,87 @@ class TaskRunner:
         from pprint import pprint
 
         from omegaconf import OmegaConf
-        from verl.utils.fs import copy_to_local
+        import transfer_queue as tq
 
         pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
         OmegaConf.resolve(config)
 
-        # download the checkpoint from hdfs
-        local_path = copy_to_local(config.actor_rollout_ref.model.path)
-
-        # instantiate tokenizer
-        from verl.utils.tokenizer import hf_processor, hf_tokenizer
-
-        trust_remote_code = config.data.get("trust_remote_code", False)
-        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        processor = hf_processor(local_path, use_fast=True)  # used for multimodal LLM, could be none
-
-        # define worker classes
-        if config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:
-            assert config.critic.strategy in ["fsdp", "fsdp2"]
-            from verl.single_controller.ray import RayWorkerGroup
-            from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
-
-            actor_rollout_cls = (
-                AsyncActorRolloutRefWorker
-                if config.actor_rollout_ref.rollout.mode == "async"
-                else ActorRolloutRefWorker
-            )
-            ray_worker_group_cls = RayWorkerGroup
-
-        elif config.actor_rollout_ref.actor.strategy == "megatron":
-            assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
-            # FIXME: This import is outdated
-            from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup  # type: ignore
-            from verl.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
-
-            actor_rollout_cls = ActorRolloutRefWorker
-            ray_worker_group_cls = NVMegatronRayWorkerGroup
-
-        else:
-            raise NotImplementedError
-
-        from verl.trainer.ppo.ray_trainer import ResourcePoolManager
+        tq.init(config.transfer_queue)
 
         try:
-            # verl >= 0.6.0
-            from verl.trainer.ppo.utils import Role
-        except ImportError:
-            # Fallback for verl <= 0.5.0
-            from verl.trainer.ppo.ray_trainer import Role  # type: ignore
+            lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
+            if lora_rank <= 0:
+                lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
+            ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+            # define worker classes
+            from verl.single_controller.ray import RayWorkerGroup
+            from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker
 
-        role_worker_mapping: dict[Role, ActorClass[Any]] = {
-            Role.ActorRollout: ray.remote(actor_rollout_cls),
-            Role.Critic: ray.remote(CriticWorker),
-        }
+            from verl.trainer.ppo.ray_trainer import ResourcePoolManager
+            from verl.trainer.ppo.utils import Role,need_reference_policy,need_critic,is_distillation_enabled
 
-        global_pool_id = "global_pool"
-        resource_pool_spec = {
-            global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
-        }
-        mapping = {
-            Role.ActorRollout: global_pool_id,
-            Role.Critic: global_pool_id,
-        }
+            # role => worker class
+            role_worker_mapping = {}
+            # role => resource pool
+            mapping = {}
 
-        # we should adopt a multi-source reward function here
-        # - for rule-based rm, we directly call a reward score
-        # - for model-based rm, we call a model
-        # - for code related prompt, we send to a sandbox if there are test cases
-        # - finally, we combine all the rewards together
-        # - The reward type depends on the tag of the data
-        if config.reward_model.enable:
-            if config.reward_model.strategy in ["fsdp", "fsdp2"]:
-                from verl.workers.fsdp_workers import RewardModelWorker
-            elif config.reward_model.strategy == "megatron":
-                from verl.workers.megatron_workers import RewardModelWorker
+            role = Role.ActorRolloutRef if need_reference_policy(config) and not ref_in_actor else Role.ActorRollout
+            role_worker_mapping[role] = ray.remote(ActorRolloutRefWorker)
+            mapping[role] = "global_pool"
+
+            if need_critic(config):
+                role_worker_mapping[Role.Critic] = ray.remote(TrainingWorker)
+                mapping[Role.Critic] = "global_pool"
+
+            # Global resource pool is used for actor, rollout, critic, ref
+            global_pool_id = "global_pool"
+            resource_pool_spec = {
+                global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
+            }
+
+            # Add separate resource pool for reward model if enabled
+            if config.reward.reward_model.enable_resource_pool:
+                if config.reward.reward_model.n_gpus_per_node <= 0:
+                    raise ValueError("config.reward.reward_model.n_gpus_per_node must be greater than 0")
+                if config.reward.reward_model.nnodes <= 0:
+                    raise ValueError("config.reward.reward_model.nnodes must be greater than 0")
+
+                reward_pool = [config.reward.reward_model.n_gpus_per_node] * config.reward.reward_model.nnodes
+                resource_pool_spec["reward_pool"] = reward_pool
+                mapping[Role.RewardModel] = "reward_pool"
             else:
-                raise NotImplementedError
-            role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
-            mapping[Role.RewardModel] = global_pool_id
+                config.reward.reward_model.nnodes = config.trainer.nnodes
+                config.reward.reward_model.n_gpus_per_node = config.trainer.n_gpus_per_node
+                mapping[Role.RewardModel] = "global_pool"
 
-        # use reference model
-        if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
-            role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
-            mapping[Role.RefPolicy] = global_pool_id
+            distillation_config = config.get("distillation")
+            if is_distillation_enabled(distillation_config):
+                if distillation_config.n_gpus_per_node <= 0:
+                    raise ValueError("config.distillation.n_gpus_per_node must be greater than 0")
+                if distillation_config.nnodes <= 0:
+                    raise ValueError("config.distillation.nnodes must be greater than 0")
 
-        reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
-        )
-        val_reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
-        )
-        resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+                teacher_pool = [distillation_config.n_gpus_per_node] * distillation_config.nnodes
+                resource_pool_spec["teacher_pool"] = teacher_pool
+                mapping[Role.TeacherModel] = "teacher_pool"
 
-        from verl.utils.dataset.rl_dataset import collate_fn
+            resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
-        # Use our special dataset
-        if train_dataset is None:
-            train_dataset = AgentDataset(
-                data_files=config.data.train_files,
-                tokenizer=tokenizer,
-                processor=processor,
-                config=config.data,
+            trainer = trainer_cls(
+                config=config,
+                role_worker_mapping=role_worker_mapping,
+                resource_pool_manager=resource_pool_manager,
+                train_dataset=train_dataset,
+                val_dataset=val_dataset,
+                store=store,
+                llm_proxy=llm_proxy,
+                adapter=adapter,
+                daemon_cls=daemon_cls,
             )
-        else:
-            train_dataset = LoadedDataset(train_dataset)
-
-        if val_dataset is None:
-            val_dataset = AgentDataset(
-                data_files=config.data.val_files,
-                tokenizer=tokenizer,
-                processor=processor,
-                config=config.data,
-            )
-        else:
-            val_dataset = LoadedDataset(val_dataset)
-
-        train_sampler = create_rl_sampler(config.data, train_dataset)
-        trainer = trainer_cls(
-            config=config,
-            tokenizer=tokenizer,
-            processor=processor,
-            role_worker_mapping=role_worker_mapping,
-            resource_pool_manager=resource_pool_manager,
-            ray_worker_group_cls=ray_worker_group_cls,
-            reward_fn=reward_fn,
-            val_reward_fn=val_reward_fn,
-            train_dataset=train_dataset,
-            val_dataset=val_dataset,
-            collate_fn=collate_fn,
-            train_sampler=train_sampler,
-            store=store,
-            llm_proxy=llm_proxy,
-            adapter=adapter,
-            daemon_cls=daemon_cls,
-        )
-        trainer.init_workers()
-        trainer.fit()
+            trainer.init_workers()
+            trainer.fit()
+        finally:
+            tq.close()
 
 
 if __name__ == "__main__":
