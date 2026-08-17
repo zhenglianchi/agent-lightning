@@ -306,20 +306,12 @@ class AgentLightningTrainer(PPOTrainer):
                 _t4 = _time.time()
                 self.checkpoint_manager.sleep_replicas()
                 _t5 = _time.time()
-                _msg = f"[BENCH-DUALWRITE] step={self.global_steps} gen breakdown: wake_replicas={_t1-_t0:.2f}s, set_up={_t2-_t1:.2f}s, replay_buffer.sample={_t3-_t2:.2f}s, clear={_t4-_t3:.2f}s, sleep_replicas={_t5-_t4:.2f}s, total_gen={_t5-_t0:.2f}s, n_triplets={len(batch.keys)}"
-                print(_msg)
-                with open("/home/ma-user/install/bench_dualwrite.txt", "a") as _f:
-                    _f.write(_msg + "\n")
-
-                bench_log("dualwrite", self.global_steps, "gen",
-                    wake_replicas=round(_t1 - _t0, 2),
-                    set_up=round(_t2 - _t1, 2),
-                    replay_buffer_sample=round(_t3 - _t2, 2),
-                    clear=round(_t4 - _t3, 2),
-                    sleep_replicas=round(_t5 - _t4, 2),
-                    total_gen=round(_t5 - _t0, 2),
-                    n_triplets=len(batch.keys),
-                )
+                timing_raw["gen_wake_replicas"] = round(_t1 - _t0, 2)
+                timing_raw["gen_set_up"] = round(_t2 - _t1, 2)
+                timing_raw["gen_replay_sample"] = round(_t3 - _t2, 2)
+                timing_raw["gen_clear"] = round(_t4 - _t3, 2)
+                timing_raw["gen_sleep_replicas"] = round(_t5 - _t4, 2)
+                timing_raw["n_triplets"] = len(batch.keys)
 
             _t_data_prep_start = _time.perf_counter()
 
@@ -539,15 +531,26 @@ class AgentLightningTrainer(PPOTrainer):
 
                     bench_log("dualwrite", self.global_steps, "step",
                         total_step=round(_step_t1 - _step_t0, 2),
-                        gen=round(timing_raw.get("gen", 0), 2),
+                        gen_wake_replicas=round(timing_raw.get("gen_wake_replicas", 0), 2),
+                        gen_set_up=round(timing_raw.get("gen_set_up", 0), 2),
+                        gen_replay_sample=round(timing_raw.get("gen_replay_sample", 0), 2),
+                        gen_clear=round(timing_raw.get("gen_clear", 0), 2),
+                        gen_sleep_replicas=round(timing_raw.get("gen_sleep_replicas", 0), 2),
+                        gen_total=round(timing_raw.get("gen", 0), 2),
+                        n_triplets=timing_raw.get("n_triplets", 0),
                         data_prep_total=round(timing_raw.pop("data_prep_total", 0), 4),
-                        reward=round(timing_raw.get("reward", 0), 4),
-                        old_log_prob=round(timing_raw.get("old_log_prob", 0), 2),
-                        ref=round(timing_raw.get("ref", 0), 2),
-                        values=round(timing_raw.get("values", 0), 2),
-                        adv=round(timing_raw.get("adv", 0), 2),
-                        update_critic=round(timing_raw.get("update_critic", 0), 2),
-                        update_actor=round(timing_raw.get("update_actor", 0), 2),
+                        ppo_reward=round(timing_raw.get("reward", 0), 4),
+                        ppo_old_log_prob=round(timing_raw.get("old_log_prob", 0), 2),
+                        ppo_ref=round(timing_raw.get("ref", 0), 2),
+                        ppo_values=round(timing_raw.get("values", 0), 2),
+                        ppo_adv=round(timing_raw.get("adv", 0), 2),
+                        ppo_update_critic=round(timing_raw.get("update_critic", 0), 2),
+                        ppo_update_actor=round(timing_raw.get("update_actor", 0), 2),
+                        transit_dispatch_total=round(timing_raw.get("transit_dispatch_total", 0), 4),
+                        transit_execute_total=round(timing_raw.get("transit_execute_total", 0), 4),
+                        transit_ray_get_total=round(timing_raw.get("transit_ray_get_total", 0), 4),
+                        transit_collect_total=round(timing_raw.get("transit_collect_total", 0), 4),
+                        transit_total=round(timing_raw.get("transit_total", 0), 4),
                         rss_mb=round(rss_mb(), 1),
                     )
 
