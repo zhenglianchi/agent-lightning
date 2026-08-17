@@ -1246,8 +1246,8 @@ class CollectionBasedLightningStore(LightningStore, Generic[T_collections]):
                 if keys_to_update:
                     print(f"[TQ6B-STORE] found {len(keys_to_update)} TQ keys after waiting {wait_attempt+1}s: {keys_to_update}", flush=True)
                     break
+            _t_wait_end = now()
             if not keys_to_update:
-                _t_wait_end = now()
                 logger.warning(f"[TQ6B-STORE] No TQ keys found for rollout {rollout_id} after {max_wait_retries}s, writing barrier only.")
                 barrier_tag = {"global_steps": global_steps, "status": "finished"}
                 max_retries = 3
