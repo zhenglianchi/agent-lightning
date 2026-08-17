@@ -59,7 +59,6 @@ from agentlightning.types import (
     Worker,
     WorkerStatus,
 )
-from agentlightning.bench_detail import bench_log, now, rss_mb
 from agentlightning.utils.id import generate_id
 from agentlightning.utils.metrics import MetricsBackend
 
@@ -1062,19 +1061,11 @@ class CollectionBasedLightningStore(LightningStore, Generic[T_collections]):
 
         See [`LightningStore.add_span()`][agentlightning.LightningStore.add_span] for semantics.
         """
-        _t0 = _time.time()
         # Update the sequence ID to be synced with latest input span
         await self._sync_span_sequence_id(span.rollout_id, span.sequence_id)
-        _t1 = _time.time()
         successful_spans = await self._add_many_spans_helper(span.rollout_id, span.attempt_id, [span])
-        _t2 = _time.time()
-        print(f"[TQ6B-STORE] add_span ENTER: rollout_id={span.rollout_id}, attempt_id={span.attempt_id}, span_id={span.span_id}, sync_seq={_t1-_t0:.3f}s, add_helper={_t2-_t1:.3f}s", flush=True)
         if successful_spans:
-            print(f"[TQ6B-STORE] add_span calling _maybe_update_tq_from_spans: rollout_id={span.rollout_id}", flush=True)
-            _t3 = _time.time()
             await self._maybe_update_tq_from_spans(span.rollout_id, span.attempt_id, successful_spans)
-            _t4 = _time.time()
-            print(f"[TQ6B-STORE] add_span _maybe_update_tq_from_spans DONE: rollout_id={span.rollout_id}, took={_t4-_t3:.3f}s", flush=True)
         return successful_spans[0] if len(successful_spans) > 0 else None
 
     @tracked("add_many_spans")
@@ -1094,13 +1085,8 @@ class CollectionBasedLightningStore(LightningStore, Generic[T_collections]):
             await self._sync_span_sequence_id(rollout_id, max(span.sequence_id for span in group_spans))
             ret = await self._add_many_spans_helper(rollout_id, attempt_id, group_spans)
             successful_spans.extend(ret)
-            print(f"[TQ6B-STORE] add_many_spans: rollout_id={rollout_id}, attempt_id={attempt_id}, spans={len(ret)}", flush=True)
             if ret:
-                print(f"[TQ6B-STORE] add_many_spans calling _maybe_update_tq_from_spans: rollout_id={rollout_id}", flush=True)
-                _t3 = _time.time()
                 await self._maybe_update_tq_from_spans(rollout_id, attempt_id, ret)
-                _t4 = _time.time()
-                print(f"[TQ6B-STORE] add_many_spans _maybe_update_tq_from_spans DONE: rollout_id={rollout_id}, took={_t4-_t3:.3f}s", flush=True)
         return successful_spans
 
     async def _maybe_update_tq_from_spans(
@@ -1126,21 +1112,18 @@ class CollectionBasedLightningStore(LightningStore, Generic[T_collections]):
         if reward is None:
             return
 
-        print(f"[TQ6B-STORE] reward span detected: rollout_id={rollout_id}, attempt_id={attempt_id}, reward={reward}", flush=True)
         try:
             rollout = await self.get_rollout_by_id(rollout_id)
             if rollout is None:
-                print(f"[TQ6B-STORE] rollout not found: rollout_id={rollout_id}", flush=True)
                 return
 
             md = rollout.metadata or {}
             data_id = str(md.get("data_id", ""))
             global_steps = md.get("global_steps", 0)
-            print(f"[TQ6B-STORE] got metadata: rollout_id={rollout_id}, data_id={data_id}, global_steps={global_steps}", flush=True)
 
             await self._update_tq_reward_async(rollout_id, reward, data_id, global_steps)
         except Exception as e:
-            logger.exception(f"[TQ6B-STORE] Failed to update TQ reward for rollout {rollout_id}: {e}")
+            logger.exception(f"Failed to update TQ reward for rollout {rollout_id}: {e}")
             # Best-effort: still write the finished barrier so sample() does not block forever
             try:
                 import transfer_queue as tq
@@ -1151,9 +1134,8 @@ class CollectionBasedLightningStore(LightningStore, Generic[T_collections]):
                     partition_id="train",
                     tag={"global_steps": _gs, "status": "finished"},
                 )
-                print(f"[TQ6B-STORE] fallback finished barrier written after error: rollout_id={rollout_id}, global_steps={_gs}", flush=True)
             except Exception:
-                logger.exception(f"[TQ6B-STORE] CRITICAL: failed to write fallback barrier for rollout {rollout_id}")
+                logger.exception(f"CRITICAL: failed to write fallback barrier for rollout {rollout_id}")
 
     async def _update_tq_reward_async(
         self,
@@ -1218,120 +1200,67 @@ class CollectionBasedLightningStore(LightningStore, Generic[T_collections]):
             }
             return TensorDict(final_data, batch_size=[batch_size])
 
-        _t0 = now()
-        _t_init_start = now()
         await asyncio.to_thread(_ensure_tq_initialized)
-        _t_init_end = now()
-
-        print(f"[TQ6B-STORE] _update_tq_reward_async start: rollout_id={rollout_id}, reward={reward}, data_id={data_id}, global_steps={global_steps}", flush=True)
 
         prefix = f"{data_id}_{rollout_id}_"
-        print(f"[TQ6B-STORE] calling tq.async_kv_list, prefix={prefix}", flush=True)
-        _t_list_start = now()
         all_items = await tq.async_kv_list(partition_id="train")
-        _t_list_end = now()
         all_keys = list(all_items.get("train", {}).keys())
         keys_to_update = [k for k in all_keys if k.startswith(prefix)]
-        print(f"[TQ6B-STORE] kv_list returned {len(all_keys)} total keys, {len(keys_to_update)} matched prefix, keys={keys_to_update}", flush=True)
 
-        _t_wait_start = now()
         if not keys_to_update:
             max_wait_retries = 5
             for wait_attempt in range(max_wait_retries):
-                logger.warning(f"[TQ6B-STORE] No TQ keys found for rollout {rollout_id} (attempt {wait_attempt+1}/{max_wait_retries}), waiting for Proxy to write data...")
+                logger.warning(f"No TQ keys found for rollout {rollout_id} (attempt {wait_attempt+1}/{max_wait_retries}), waiting for Proxy to write data...")
                 await asyncio.sleep(1.0)
                 all_items = await tq.async_kv_list(partition_id="train")
                 all_keys = list(all_items.get("train", {}).keys())
                 keys_to_update = [k for k in all_keys if k.startswith(prefix)]
                 if keys_to_update:
-                    print(f"[TQ6B-STORE] found {len(keys_to_update)} TQ keys after waiting {wait_attempt+1}s: {keys_to_update}", flush=True)
                     break
-            _t_wait_end = now()
             if not keys_to_update:
-                logger.warning(f"[TQ6B-STORE] No TQ keys found for rollout {rollout_id} after {max_wait_retries}s, writing barrier only.")
+                logger.warning(f"No TQ keys found for rollout {rollout_id} after {max_wait_retries}s, writing barrier only.")
                 barrier_tag = {"global_steps": global_steps, "status": "finished"}
                 max_retries = 3
                 for attempt in range(max_retries):
                     try:
-                        print(f"[TQ6B-STORE] writing finished barrier (no data keys, attempt {attempt+1}/{max_retries}): rollout_id={rollout_id}", flush=True)
-                        _t_barrier_start = now()
                         await tq.async_kv_put(
                             key=rollout_id,
                             partition_id="train",
                             tag=barrier_tag,
                         )
-                        _t_barrier_end = now()
-                        bench_log("store_reward", global_steps, "store_update_reward",
-                            store_tq_init=_t_init_end - _t_init_start,
-                            store_tq_list=_t_list_end - _t_list_start,
-                            store_tq_wait=_t_wait_end - _t_wait_start,
-                            store_barrier_write=_t_barrier_end - _t_barrier_start,
-                            store_total=_t_barrier_end - _t0,
-                            n_keys=0,
-                            rss_mb=rss_mb())
-                        print(f"[TQ6B-STORE] finished barrier written (no data keys): rollout_id={rollout_id}", flush=True)
                         return
                     except Exception as barrier_e:
-                        print(f"[TQ6B-STORE] barrier write attempt {attempt+1} failed: {barrier_e}", flush=True)
                         if attempt < max_retries - 1:
                             await asyncio.sleep(1.0 * (attempt + 1))
                         else:
-                            logger.error(f"[TQ6B-STORE] FAILED rollout {rollout_id}: no TQ data keys found after {max_wait_retries}s AND barrier write failed after {max_retries} retries. This rollout will block sample(). reward={reward}, data_id={data_id}, global_steps={global_steps}")
+                            logger.error(f"FAILED rollout {rollout_id}: no TQ data keys found after {max_wait_retries}s AND barrier write failed after {max_retries} retries. This rollout will block sample(). reward={reward}, data_id={data_id}, global_steps={global_steps}")
                             raise
-        else:
-            _t_wait_end = _t_wait_start
 
-        print(f"[TQ6B-STORE] calling tq.async_kv_batch_get: keys={keys_to_update}", flush=True)
-        _t_get_start = now()
         existing = await tq.async_kv_batch_get(
             keys=keys_to_update, partition_id="train", select_fields=["responses"]
         )
-        _t_get_end = now()
-        print(f"[TQ6B-STORE] kv_batch_get done, got {len(existing.get('responses', []))} responses", flush=True)
 
         response_ids_list = [existing["responses"][i] for i in range(len(keys_to_update))]
-        _t_build_start = now()
         fields = await asyncio.to_thread(_build_reward_tensors, response_ids_list, reward)
-        _t_build_end = now()
-        print(f"[TQ6B-STORE] calling tq.async_kv_batch_put: keys={keys_to_update}", flush=True)
-        _t_update_start = now()
         await tq.async_kv_batch_put(
             keys=keys_to_update, partition_id="train", fields=fields,
         )
-        _t_update_end = now()
-        print(f"[TQ6B-STORE] reward updated for {len(keys_to_update)} keys: {keys_to_update}", flush=True)
 
         barrier_tag = {"global_steps": global_steps, "status": "finished"}
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                print(f"[TQ6B-STORE] calling tq.async_kv_put finished barrier (attempt {attempt+1}/{max_retries}): rollout_id={rollout_id}", flush=True)
-                _t_barrier_start = now()
                 await tq.async_kv_put(
                     key=rollout_id,
                     partition_id="train",
                     tag=barrier_tag,
                 )
-                _t_barrier_end = now()
-                bench_log("store_reward", global_steps, "store_update_reward",
-                    store_tq_init=_t_init_end - _t_init_start,
-                    store_tq_list=_t_list_end - _t_list_start,
-                    store_tq_wait=_t_wait_end - _t_wait_start,
-                    store_tq_get=_t_get_end - _t_get_start,
-                    store_build_tensors=_t_build_end - _t_build_start,
-                    store_tq_update=_t_update_end - _t_update_start,
-                    store_barrier_write=_t_barrier_end - _t_barrier_start,
-                    store_total=_t_barrier_end - _t0,
-                    n_keys=len(keys_to_update),
-                    rss_mb=rss_mb())
-                print(f"[TQ6B-STORE] reward+barrier written for rollout_id={rollout_id}", flush=True)
                 return
             except Exception as barrier_e:
-                print(f"[TQ6B-STORE] barrier write attempt {attempt+1} failed: {barrier_e}", flush=True)
                 if attempt < max_retries - 1:
                     await asyncio.sleep(1.0 * (attempt + 1))
                 else:
-                    logger.error(f"[TQ6B-STORE] FAILED rollout {rollout_id}: reward data updated for {len(keys_to_update)} keys but barrier write failed after {max_retries} retries. This rollout will block sample(). reward={reward}, data_id={data_id}, global_steps={global_steps}, keys={keys_to_update}")
+                    logger.error(f"FAILED rollout {rollout_id}: reward data updated for {len(keys_to_update)} keys but barrier write failed after {max_retries} retries. This rollout will block sample(). reward={reward}, data_id={data_id}, global_steps={global_steps}, keys={keys_to_update}")
                     raise
 
     @tracked("add_otel_span")
@@ -1346,9 +1275,6 @@ class CollectionBasedLightningStore(LightningStore, Generic[T_collections]):
 
         See [`LightningStore.add_otel_span()`][agentlightning.LightningStore.add_otel_span] for semantics.
         """
-        import time as _time
-        _t0 = _time.time()
-        print(f"[TQ6B-STORE] add_otel_span ENTER: rollout_id={rollout_id}, attempt_id={attempt_id}, seq_id={sequence_id}", flush=True)
         if sequence_id is None:
             # Issue a new sequence ID for the rollout
             sequence_id = (await self._issue_many_span_sequence_ids([rollout_id]))[0]
@@ -1360,16 +1286,9 @@ class CollectionBasedLightningStore(LightningStore, Generic[T_collections]):
         span = Span.from_opentelemetry(
             readable_span, rollout_id=rollout_id, attempt_id=attempt_id, sequence_id=sequence_id
         )
-        _t1 = _time.time()
         ret = await self._add_many_spans_helper(rollout_id, attempt_id, [span])
-        _t2 = _time.time()
-        print(f"[TQ6B-STORE] add_otel_span: rollout_id={rollout_id}, from_otel+add_helper={_t2-_t1:.3f}s, ret={len(ret)}", flush=True)
         if ret:
-            print(f"[TQ6B-STORE] add_otel_span calling _maybe_update_tq_from_spans: rollout_id={rollout_id}", flush=True)
-            _t3 = _time.time()
             await self._maybe_update_tq_from_spans(rollout_id, attempt_id, ret)
-            _t4 = _time.time()
-            print(f"[TQ6B-STORE] add_otel_span _maybe_update_tq_from_spans DONE: rollout_id={rollout_id}, took={_t4-_t3:.3f}s", flush=True)
         return ret[0] if len(ret) > 0 else None
 
     @tracked("_insert_spans_with_fallback")
