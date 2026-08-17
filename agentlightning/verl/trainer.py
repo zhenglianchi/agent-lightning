@@ -320,6 +320,8 @@ class AgentLightningTrainer(PPOTrainer):
                     n_triplets=len(batch.keys),
                 )
 
+            _t_data_prep_start = _time.perf_counter()
+
             '''
             TODO: 后续实现
             if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
@@ -380,6 +382,8 @@ class AgentLightningTrainer(PPOTrainer):
             batch = self._balance_batch(batch, metrics=metrics)
 
             print("padding: ", len(batch.tags))
+
+            _t_data_prep_end = _time.perf_counter()
 
             # ===== 4. Compute old log prob =====
             # PPOTrainer版：内部计算entropy，直接 metrics.update({"actor/entropy": ...})
@@ -512,6 +516,7 @@ class AgentLightningTrainer(PPOTrainer):
                     bench_log("dualwrite", self.global_steps, "step",
                         total_step=round(_step_t1 - _step_t0, 2),
                         gen=round(timing_raw.get("gen", 0), 2),
+                        data_prep_total=round(_t_data_prep_end - _t_data_prep_start, 4),
                         reward=round(timing_raw.get("reward", 0), 4),
                         old_log_prob=round(timing_raw.get("old_log_prob", 0), 2),
                         ref=round(timing_raw.get("ref", 0), 2),
