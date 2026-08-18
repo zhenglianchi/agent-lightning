@@ -18,6 +18,7 @@ import functools
 import logging
 import time
 import warnings
+from agentlightning.bench_detail import bench_log, now
 from collections import defaultdict
 from contextvars import ContextVar
 from types import CoroutineType
@@ -1202,6 +1203,7 @@ class CollectionBasedLightningStore(LightningStore, Generic[T_collections]):
 
         await asyncio.to_thread(_ensure_tq_initialized)
 
+        _t0 = now()
         prefix = f"{data_id}_{rollout_id}_"
         all_items = await tq.async_kv_list(partition_id="train")
         all_keys = list(all_items.get("train", {}).keys())
@@ -1228,6 +1230,13 @@ class CollectionBasedLightningStore(LightningStore, Generic[T_collections]):
                             partition_id="train",
                             tag=barrier_tag,
                         )
+                        _t5 = now()
+                        bench_log("store_reward", global_steps, "store_reward_update",
+                            reward_update_total=round(_t5 - _t0, 4),
+                            n_keys=0,
+                            rollout_id=rollout_id,
+                            note="no_keys_barrier_only",
+                        )
                         return
                     except Exception as barrier_e:
                         if attempt < max_retries - 1:
@@ -1236,15 +1245,19 @@ class CollectionBasedLightningStore(LightningStore, Generic[T_collections]):
                             logger.error(f"FAILED rollout {rollout_id}: no TQ data keys found after {max_wait_retries}s AND barrier write failed after {max_retries} retries. This rollout will block sample(). reward={reward}, data_id={data_id}, global_steps={global_steps}")
                             raise
 
+        _t1 = now()
         existing = await tq.async_kv_batch_get(
             keys=keys_to_update, partition_id="train", select_fields=["responses"]
         )
+        _t2 = now()
 
         response_ids_list = [existing["responses"][i] for i in range(len(keys_to_update))]
         fields = await asyncio.to_thread(_build_reward_tensors, response_ids_list, reward)
+        _t3 = now()
         await tq.async_kv_batch_put(
             keys=keys_to_update, partition_id="train", fields=fields,
         )
+        _t4 = now()
 
         barrier_tag = {"global_steps": global_steps, "status": "finished"}
         max_retries = 3
@@ -1254,6 +1267,17 @@ class CollectionBasedLightningStore(LightningStore, Generic[T_collections]):
                     key=rollout_id,
                     partition_id="train",
                     tag=barrier_tag,
+                )
+                _t5 = now()
+                bench_log("store_reward", global_steps, "store_reward_update",
+                    reward_update_total=round(_t5 - _t0, 4),
+                    tq_list=round(_t1 - _t0, 4),
+                    tq_batch_get=round(_t2 - _t1, 4),
+                    tensor_build=round(_t3 - _t2, 4),
+                    tq_put_reward=round(_t4 - _t3, 4),
+                    tq_put_barrier=round(_t5 - _t4, 4),
+                    n_keys=len(keys_to_update),
+                    rollout_id=rollout_id,
                 )
                 return
             except Exception as barrier_e:
