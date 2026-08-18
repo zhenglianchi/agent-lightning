@@ -145,26 +145,8 @@ async def _write_tq_data_zero_reward(
                 fields=fields,
                 tags=tags,
             )
-            _t_write_end = now()
-            _unpadded_bytes = sum(s * 8 for s in _seq_lens)
-            bench_log("store_reward", global_steps, "proxy_write_tq",
-                proxy_adapt=_t_adapt_end - _t0,
-                proxy_build=_t_build_end - _t_build_start,
-                proxy_tq_write=_t_write_end - _t_write_start,
-                proxy_total=_t_write_end - _t0,
-                n_triplets=len(fields_list),
-                unpadded_bytes=_unpadded_bytes,
-                avg_seq_len=sum(_seq_lens) / len(_seq_lens) if _seq_lens else 0,
-                max_seq_len=max(_seq_lens) if _seq_lens else 0,
-                min_seq_len=min(_seq_lens) if _seq_lens else 0,
-                rss_mb=rss_mb())
             print(f"[TQ6B-PROXY] wrote {len(fields_list)} TQ data keys for rollout_id={rollout_id}, keys={keys}", flush=True)
         else:
-            bench_log("store_reward", global_steps, "proxy_write_tq",
-                proxy_adapt=_t_adapt_end - _t0,
-                proxy_total=now() - _t0,
-                n_triplets=0,
-                rss_mb=rss_mb())
             print(f"[TQ6B-PROXY] no valid fields to write for rollout_id={rollout_id}", flush=True)
     except Exception as e:
         logger.exception(f"[TQ6B-PROXY] Failed to write TQ data for rollout {rollout_id}: {e}")
