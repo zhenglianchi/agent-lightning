@@ -301,8 +301,9 @@ class AgentLightningTrainer(RayPPOTrainer):
                 reward_extra_infos_dict = {}
             # for agent mode, pad the lengths to calculate old log prob, ref, and values
             print("padding before: ",batch.batch.batch_size)
-            micro_bsz = self.config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
-            divisor = self.actor_rollout_wg.world_size * micro_bsz
+            dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+            mini_batch = self.config.actor_rollout_ref.actor.ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+            divisor = math.lcm(dp_size, mini_batch)
             batch, pad_size = pad_dataproto_to_divisor(batch, divisor)
             print("padding: ",batch.batch.batch_size)
             _t_data_prep_end = _time.time()
