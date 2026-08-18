@@ -286,6 +286,7 @@ class AgentModeDaemon:
 
         self._bench_query_total = 0.0
         self._bench_adapt_total = 0.0
+        self._bench_serial_tail = 0.0
 
     def _internal_loop_runner(self):
         """Run the internal loop."""
@@ -597,6 +598,7 @@ class AgentModeDaemon:
         """Synchronous wrapper for setting up data and server resources."""
         self._bench_query_total = 0.0
         self._bench_adapt_total = 0.0
+        self._bench_serial_tail = 0.0
         coro = self._async_set_up(data, server_addresses, is_train)
 
         if self.mode == "v0":
@@ -686,6 +688,8 @@ class AgentModeDaemon:
 
     async def _async_run_until_finished(self, verbose: bool = True):
         """Async helper to wait for all tasks to complete."""
+        import time as _time
+        _bench_last_productive_poll = _time.time()
         while len(self._completed_rollouts_v0) < self._total_tasks_queued:
             if self.mode == "v0":
                 completed_batch = await self.server.retrieve_completed_rollouts()
@@ -693,10 +697,12 @@ class AgentModeDaemon:
                 completed_batch = await self.store.wait_for_rollouts(
                     rollout_ids=list(self._task_id_to_original_sample.keys()), timeout=0
                 )
+            _has_new = False
             for rollout in completed_batch:
                 if rollout.rollout_id in self._completed_rollouts_v0:
                     # Already processed, skip
                     continue
+                _has_new = True
                 if isinstance(rollout, Rollout):
                     rollout = await self._validate_data_v1(rollout)
                 else:
@@ -705,10 +711,13 @@ class AgentModeDaemon:
                     print(f"Warning: Received unknown rollout ID {rollout.rollout_id}, skipping.")
                 else:
                     self._completed_rollouts_v0[rollout.rollout_id] = rollout
+            if _has_new:
+                _bench_last_productive_poll = _time.time()
             if verbose:
                 print(f"Completed {len(self._completed_rollouts_v0)}/{self._total_tasks_queued} tasks...")
             await asyncio.sleep(5)
 
+        self._bench_serial_tail = _time.time() - _bench_last_productive_poll
         print("All tasks finished.")
 
     def run_until_all_finished(self, verbose: bool = True):

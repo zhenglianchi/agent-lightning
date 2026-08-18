@@ -487,6 +487,8 @@ class AgentLightningTrainer(RayPPOTrainer):
                 (_t3 - _t2)
                 - getattr(self.agent_mode_daemon, "_bench_query_total", 0.0)
                 - getattr(self.agent_mode_daemon, "_bench_adapt_total", 0.0), 2),
+            gen_serial_tail=round(
+                getattr(self.agent_mode_daemon, "_bench_serial_tail", 0.0), 4),
             gen_get_train_data_batch=round(_t4 - _t3, 2),
             gen_clear=round(_t5 - _t4, 2),
             gen_sleep_replicas=round(_t6 - _t5, 2),
