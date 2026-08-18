@@ -1246,9 +1246,23 @@ class CollectionBasedLightningStore(LightningStore, Generic[T_collections]):
                             raise
 
         _t1 = now()
-        existing = await tq.async_kv_batch_get(
-            keys=keys_to_update, partition_id="train", select_fields=["responses"]
-        )
+        max_field_retries = 5
+        for field_attempt in range(max_field_retries):
+            try:
+                existing = await tq.async_kv_batch_get(
+                    keys=keys_to_update, partition_id="train", select_fields=["responses"]
+                )
+                break
+            except ValueError as e:
+                if "not ready" in str(e).lower() and field_attempt < max_field_retries - 1:
+                    logger.warning(
+                        f"Fields not ready for rollout {rollout_id} "
+                        f"(attempt {field_attempt+1}/{max_field_retries}), "
+                        f"waiting for Proxy to finish writing..."
+                    )
+                    await asyncio.sleep(1.0)
+                else:
+                    raise
         _t2 = now()
 
         response_ids_list = [existing["responses"][i] for i in range(len(keys_to_update))]
